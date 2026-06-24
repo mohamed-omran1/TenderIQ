@@ -1,0 +1,38 @@
+# Local dev environment for TenderIQ.
+# Brings up PostgreSQL 16 + pgvector and Redis. FastAPI runs via uvicorn --reload.
+#
+# Usage:
+#   docker compose up -d
+#   cd backend && alembic upgrade head
+services:
+  db:
+    # Official pgvector image (postgres 16 + extension preinstalled).
+    image: pgvector/pgvector:pg16
+    container_name: tenderiq-db
+    environment:
+      POSTGRES_USER: tenderiq
+      POSTGRES_PASSWORD: tenderiq
+      POSTGRES_DB: tenderiq
+    ports:
+      - "5432:5432"
+    volumes:
+      - tenderiq_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tenderiq -d tenderiq"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: tenderiq-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  tenderiq_pgdata:

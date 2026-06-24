@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+/*
+ * Tailwind CSS v4 — CSS-first config. No tailwind.config.js needed; content
+ * detection is automatic. Add @theme customizations here if needed.
+ */
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    "Helvetica Neue",
+    Arial,
+    sans-serif;
+}

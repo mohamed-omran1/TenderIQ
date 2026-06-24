@@ -1,0 +1,104 @@
+# ── Python / FastAPI ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+.installed.cfg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables — NEVER commit these
+.env
+.env.local
+.env.*.local
+.env.production
+.env.staging
+
+# Alembic
+# (keep versions/ folder but ignore any local override files)
+alembic.ini.local
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ── Next.js / Frontend ────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.cache/
+frontend/build/
+
+# Next.js env files
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+frontend/.env.production
+
+# ── Node (root level, if any scripts) ────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ── Docker ───────────────────────────────────────────────────────────────
+# Keep docker-compose.yml but ignore any local override
+docker-compose.override.yml
+docker-compose.local.yml
+
+# ── Database / Storage ────────────────────────────────────────────────────
+# Local uploaded tender PDFs — never commit client data
+backend/uploads/
+backend/storage/
+*.pdf
+
+# Local Postgres data volume (if mapped to disk)
+postgres_data/
+pgdata/
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Secrets / Keys ────────────────────────────────────────────────────────
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+.secrets/
+
+# ── Logs ──────────────────────────────────────────────────────────────────
+*.log
+logs/

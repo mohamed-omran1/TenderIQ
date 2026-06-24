@@ -1,0 +1,64 @@
+[project]
+name = "tenderiq-backend"
+version = "0.1.0"
+description = "TenderIQ — FastAPI + LangGraph backend for tender-document analysis."
+requires-python = ">=3.11"
+dependencies = [
+    # Web framework (أحدث إصدارات مستقرة بـ Modern Syntax)
+    "fastapi",
+    "uvicorn[standard]",
+    "python-multipart",      # مطلوب لرفع ملفات الـ الـ PDFs
+    
+    # Data validation / config (Pydantic v2+ الحديث بالكامل)
+    "pydantic>=2.10",
+    "pydantic-settings",
+    
+    # Database layer (SQLAlchemy 2.0 Async المودرن)
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg",                 # لربط الـ PostgreSQL أسنك
+    "alembic",
+    "pgvector",               # الـ Vector column للـ SQLAlchemy
+    
+    # Auth / rate limiting
+    "bcrypt",
+    "redis",                    # الـ Async Redis client الجديد
+    
+    # PDF extraction
+    "pymupdf",                 # أسرع مكتبة لقراءة الـ PDFs (fitz)
+    
+    # Embeddings & AI (أحدث إصدارات لـ LangChain v0.3+ والـ Google GenAI)
+    "langchain-google-genai",
+    "tenacity",                 # للـ retry والتعامل الذكي مع الـ Rate Limits
+    
+    # Agent runtime (LangGraph الجديد لتصميم الـ Multi-Agent Workflows)
+    "langgraph",
+    "langchain",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",                   # الـ Async TestClient لـ FastAPI
+    "anyio",
+    "fakeredis",               # عشان التيست يقدر يشتغل من غير ما يقوم راديس حقيقي
+    "reportlab",                # عشان تكريت ملفات PDF وهمية جوه الـ Tests
+    "ruff",                    # أسرع أداة لتنسيق وعمل Linting للكود
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
