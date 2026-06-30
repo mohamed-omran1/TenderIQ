@@ -3,18 +3,27 @@
 Lifespan: future home of graph-compile-at-startup (Week 2). For REQ-001 we
 only need the app to be importable for tests and runnable via uvicorn.
 """
+
 from __future__ import annotations
 
+import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
+
+# Psycopg's async pool requires SelectorEventLoop on Windows. Uvicorn defaults
+# to ProactorEventLoop on Windows, so set the policy before uvicorn creates it.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.agents.graph import graph
 from app.config import get_settings
 from app.errors import ApiError, RateLimited
-from app.routers import tenders
+from app.routers import analytics, company, tenders
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,7 +33,8 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Week 2 will compile the LangGraph graph here and stash it on app.state.
+    # REQ-003: ensure LangGraph Postgres checkpoint tables exist on startup.
+    await graph.checkpointer.setup()
     yield
 
 
@@ -59,6 +69,8 @@ def create_app() -> FastAPI:
         )
 
     app.include_router(tenders.router)
+    app.include_router(company.router)
+    app.include_router(analytics.router)
 
     @app.get("/health", tags=["ops"])
     async def health() -> dict[str, str]:

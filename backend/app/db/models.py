@@ -9,6 +9,7 @@ cross-tenant-leak defence (rag-architect + api-security-reviewer skills).
 Closed value sets use TEXT + CHECK (not native ENUM): adding a value is a
 plain migration instead of ALTER TYPE (database-designer skill).
 """
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -17,6 +18,7 @@ from typing import Any
 from sqlalchemy import (
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -25,7 +27,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy import JSON
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.config import get_settings
@@ -48,18 +50,32 @@ class Company(Base):
     # bcrypt hash of the raw API key; never log or return this.
     api_key_hash: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     # PRD §6.1 / Architecture §6.2 — free tier 100 analyses/day; per-company override.
-    monthly_doc_limit: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=100
-    )
+    monthly_doc_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     tenders: Mapped[list[Tender]] = relationship(back_populates="company")
+    profile: Mapped[CompanyProfile | None] = relationship(
+        back_populates="company",
+        uselist=False,
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class CompanyProfile(Base):
-    """1:1 with companies. JSONB benchmarking profile for the Feasibility Scorer."""
+    """1:1 benchmarking profile consumed by the Feasibility Scorer (REQ-002).
+
+    `company_id` is both the foreign key AND the primary key — the idiomatic
+    pattern for a true 1:1 (PRD: "Multiple profiles per company are deferred to
+    v2"), and it makes the `ON CONFLICT (company_id)` upsert atomic and trivial.
+
+    `financial_capacity` holds turnover / bonding figures — commercially
+    sensitive, so it must never appear in logs (REQ-002 Security NFR). The
+    `__repr__` below redacts it so even `repr(obj)` / default exception logging
+    can't leak it (ai-security + senior-fullstack skills).
+    """
 
     __tablename__ = "company_profiles"
 
@@ -68,10 +84,48 @@ class CompanyProfile(Base):
         ForeignKey("companies.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    specialisations: Mapped[Any] = mapped_column(JSON, nullable=True)
-    financial_capacity: Mapped[Any] = mapped_column(JSON, nullable=True)
-    past_projects: Mapped[Any] = mapped_column(JSON, nullable=True)
-    max_project_value: Mapped[float | None] = mapped_column(nullable=True)
+    specializations: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    financial_capacity: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    geographic_reach: Mapped[list[Any]] = mapped_column(JSONB, nullable=False)
+    past_projects: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    max_project_value: Mapped[float] = mapped_column(Float, nullable=False)
+    # Server-managed on every write via a BEFORE UPDATE trigger (migration 0002)
+    # AND explicitly SET in the upsert. Never accepted from the client.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    company: Mapped[Company] = relationship(back_populates="profile")
+
+    __table_args__ = (
+        CheckConstraint(
+            "jsonb_typeof(specializations) = 'array' AND jsonb_array_length(specializations) >= 1",
+            name="company_profiles_specializations_nonempty",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(geographic_reach) = 'array' "
+            "AND jsonb_array_length(geographic_reach) >= 1",
+            name="company_profiles_geographic_reach_nonempty",
+        ),
+        CheckConstraint(
+            "max_project_value > 0",
+            name="company_profiles_max_project_value_positive",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        # financial_capacity intentionally omitted — it is sensitive and must
+        # never surface in logs, tracebacks, or debugger sessions.
+        return (
+            f"CompanyProfile(company_id={self.company_id!r}, "
+            f"specializations={self.specializations!r}, "
+            f"geographic_reach={self.geographic_reach!r}, "
+            f"past_projects_count={len(self.past_projects) if self.past_projects else 0}, "
+            f"max_project_value={self.max_project_value!r}, "
+            f"updated_at={self.updated_at!r})"
+        )
 
 
 class Tender(Base):
@@ -115,6 +169,12 @@ class Tender(Base):
 
     company: Mapped[Company] = relationship(back_populates="tenders")
     chunks: Mapped[list[TenderChunk]] = relationship(
+        back_populates="tender",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    analysis_runs: Mapped[list["AnalysisRun"]] = relationship(
+        "AnalysisRun",
         back_populates="tender",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -185,6 +245,97 @@ class TenderChunk(Base):
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
     )
+
+
+class AnalysisRun(Base):
+    """One execution of the LangGraph analysis pipeline for a tender.
+
+    State transitions: pending -> running -> awaiting_hitl -> complete
+    (or failed). `agent_trace` is an append-only audit log of every node that
+    ran; updates are atomic JSONB concatenations, never read-modify-write.
+    """
+
+    __tablename__ = "analysis_runs"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, server_default=text("gen_random_uuid()::text")
+    )
+    tender_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    company_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default="pending",
+    )
+    feasibility_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    agent_trace: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    aggregated_results: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    error_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    tender: Mapped[Tender] = relationship("Tender", back_populates="analysis_runs")
+    cost_events: Mapped[list["LlmCostEvent"]] = relationship(
+        "LlmCostEvent",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending', 'running', 'awaiting_hitl', 'complete', 'failed')",
+            name="analysis_runs_state_check",
+        ),
+        # Status polling always looks up the latest run for a tender.
+        Index("ix_analysis_runs_tender_started", "tender_id", "started_at"),
+    )
+
+
+class LlmCostEvent(Base):
+    """One row per LLM call per node — cost-tracking audit log (REQ-003 Slice 3).
+
+    Written exclusively by CostTrackingHandler.on_llm_end; never exposed in
+    application logs at DEBUG or INFO level (token counts and USD cost are
+    commercially sensitive).
+    """
+
+    __tablename__ = "llm_cost_events"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, server_default=text("gen_random_uuid()::text")
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("analysis_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    node_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    model: Mapped[str] = mapped_column(String(255), nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    cost_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    logged_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    run: Mapped[AnalysisRun] = relationship("AnalysisRun", back_populates="cost_events")
+
+    __table_args__ = (Index("ix_llm_cost_events_run_id", "run_id"),)
 
 
 # Add the (tender_id, chunk_index) uniqueness as a separate Index to keep

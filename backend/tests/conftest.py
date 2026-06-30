@@ -10,7 +10,7 @@ Design (per senior-qa skill):
 """
 from __future__ import annotations
 
-import asyncio
+import os
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -32,14 +32,18 @@ from app.db.session import get_session
 from app.main import create_app
 from app.middleware import rate_limit as rate_limit_module
 from app.middleware.auth import _hash_key
-from app.db.models import Company
+from app.db.models import Company, CompanyProfile, Tender, TenderChunk
 
 settings = get_settings()
+
+# Allow CI/dev to point tests at a dedicated test database without touching
+# the running dev database (REQ-002 QA slice).
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", settings.database_url)
 
 # A separate engine+sessionmaker bound to the test connection so we can wrap
 # every test in a single rollback. Tests must not see each other's writes.
 _test_engine = create_async_engine(
-    settings.database_url,
+    TEST_DATABASE_URL,
     pool_pre_ping=True,
     # NullPool: never reuse connections across event loops. pytest-asyncio
     # uses a fresh loop per test by default; a shared pool would hand a test
@@ -51,14 +55,6 @@ _test_engine = create_async_engine(
 _TestSessionLocal = async_sessionmaker(
     bind=_test_engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
 )
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    """Single event loop for the whole session — pytest-asyncio default is per-test."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
@@ -74,6 +70,28 @@ async def _create_schema() -> AsyncIterator[None]:
     async with _test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
     await _test_engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_checkpointer() -> None:
+    """Clear the graph checkpointer's pool + saver before each test.
+
+    ``_ensure_saver`` (:file:`app/agents/graph.py`) lazily creates a psycopg
+    ``AsyncConnectionPool`` bound to the current event loop.  pytest-asyncio
+    uses a fresh event loop per test function by default; if the checkpointer
+    still holds a pool from a prior loop, ``_ensure_saver`` will try to close
+    it via ``await self._pool.close()`` — but that pool's connections belong
+    to the **old** (closed) loop, producing ``CancelledError``.
+
+    We set both ``_pool`` and ``_saver`` to ``None`` before each test so that
+    ``_ensure_saver`` skips the close step and creates a fresh pool in the
+    current test's loop.  The old pool is garbage-collected along with its
+    dead event loop — no need for explicit teardown.
+    """
+    from app.agents.graph import graph
+
+    graph.checkpointer._pool = None
+    graph.checkpointer._saver = None
 
 
 @pytest_asyncio.fixture
@@ -359,4 +377,153 @@ async def stub_embeddings(monkeypatch):
     # `run_ingestion` -> `ingest_tender`).
     monkeypatch.setattr(ingestor_module, "get_embeddings_client", lambda: stub)
     return stub
+
+
+# ---- REQ-002 company-profile fixtures ---------------------------------------
+
+@pytest_asyncio.fixture
+async def async_client(app_client: AsyncClient) -> AsyncIterator[AsyncClient]:
+    """Alias for app_client matching the REQ-002 QA slice naming."""
+    yield app_client
+
+
+@pytest_asyncio.fixture
+async def company_api_key(company_a: tuple[Company, str]) -> str:
+    """Raw API key for the primary test tenant."""
+    return company_a[1]
+
+
+@pytest_asyncio.fixture
+async def second_company_api_key(company_b: tuple[Company, str]) -> str:
+    """Raw API key for a second test tenant (cross-tenant isolation)."""
+    return company_b[1]
+
+
+@pytest_asyncio.fixture
+async def clean_profile(
+    db: AsyncSession, company_a: tuple[Company, str]
+) -> AsyncIterator[None]:
+    """Delete any profile for the primary test tenant before and after a test."""
+    from sqlalchemy import delete
+
+    company_id = company_a[0].id
+
+    async def _delete() -> None:
+        await db.execute(
+            delete(CompanyProfile).where(CompanyProfile.company_id == company_id)
+        )
+        await db.commit()
+
+    await _delete()
+    yield
+    await _delete()
+
+
+@pytest_asyncio.fixture
+async def profile_lookup_session(
+    db: AsyncSession, monkeypatch: Any
+) -> AsyncIterator[None]:
+    """Route profile_lookup's SessionLocal through the test transaction."""
+    import importlib
+    from contextlib import asynccontextmanager
+
+    profile_lookup_module = importlib.import_module("app.agents.tools.profile_lookup")
+
+    @asynccontextmanager
+    async def _test_session() -> AsyncIterator[AsyncSession]:
+        yield db
+
+    monkeypatch.setattr(profile_lookup_module, "SessionLocal", _test_session)
+    yield
+
+
+# ---- REQ-003 analysis-run fixtures ------------------------------------------
+
+EMBEDDING_STUB = [0.01] * get_settings().embedding_dimensions
+
+
+@pytest_asyncio.fixture
+async def ready_tender(db: AsyncSession, company_a: tuple[Company, str]) -> Tender:
+    """Tender with status='ready' and 3 tender_chunks rows."""
+    company, _ = company_a
+    tender = Tender(
+        id=str(uuid.uuid4()),
+        company_id=company.id,
+        filename="analysis_test.pdf",
+        storage_path="/tmp/analysis_test.pdf",
+        file_size_bytes=100,
+        status="ready",
+    )
+    db.add(tender)
+    await db.flush()
+
+    for i in range(3):
+        chunk = TenderChunk(
+            id=str(uuid.uuid4()),
+            tender_id=tender.id,
+            company_id=company.id,
+            chunk_index=i,
+            content=f"Chunk {i} content for analysis testing.",
+            detected_language="en",
+            embedding=EMBEDDING_STUB,
+        )
+        db.add(chunk)
+    await db.flush()
+    return tender
+
+
+@pytest_asyncio.fixture
+async def company_with_profile(
+    db: AsyncSession, company_a: tuple[Company, str]
+) -> tuple[Company, str]:
+    """company_a augmented with a valid CompanyProfile row."""
+    company, raw_key = company_a
+    profile = CompanyProfile(
+        company_id=company.id,
+        specializations=["civil"],
+        financial_capacity={
+            "currency": "SAR",
+            "annual_turnover": 1_000_000,
+            "available_bonding_capacity": 500_000,
+        },
+        geographic_reach=["SA"],
+        past_projects=[],
+        max_project_value=500_000,
+    )
+    db.add(profile)
+    await db.flush()
+    return company_a
+
+
+@pytest_asyncio.fixture
+async def company_without_profile(db: AsyncSession) -> tuple[Company, str]:
+    """Company with NO CompanyProfile (failure-path test)."""
+    return await create_company(db, name="No Profile Co")
+
+
+@pytest_asyncio.fixture
+async def graph_session(db: AsyncSession, monkeypatch: Any) -> None:
+    """Route run_graph's with_session() through the per-test transaction.
+
+    The POST /analyse endpoint schedules run_graph as a BackgroundTask, which
+    opens its own database session via ``with_session()`` from
+    ``app.db.session``. Without this patch, that session would use the
+    production engine — writes would leak outside the test transaction and
+    persist across tests.
+
+    We patch the module-level reference that tenders.py imported at load time
+    so that ``run_graph`` uses the same per-test ``db`` session, keeping all
+    writes inside the savepoint-based rollback boundary.
+    """
+    from app.routers import tenders as tenders_router
+
+    class _GraphSessionCtx:
+        async def __aenter__(self) -> AsyncSession:
+            return db
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(tenders_router, "with_session", lambda: _GraphSessionCtx())
+    yield
 

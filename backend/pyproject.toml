@@ -32,6 +32,8 @@ dependencies = [
     
     # Agent runtime (LangGraph الجديد لتصميم الـ Multi-Agent Workflows)
     "langgraph",
+    "langgraph-checkpoint-postgres",  # AsyncPostgresSaver for HITL checkpoints
+    "psycopg[binary]",                # Postgres driver used by the LangGraph checkpointer
     "langchain",
 ]
 
