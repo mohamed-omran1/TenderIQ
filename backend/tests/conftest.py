@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from langchain_core.exceptions import OutputParserException
 from sqlalchemy import event
 from sqlalchemy.pool import NullPool
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -25,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 # `fakeredis` provides an in-process async Redis for deterministic rate-limit tests.
 import fakeredis.aioredis
 
+from app.agents.skills.risk_clause_extraction import RiskFinding, RiskRadarOutput
 from app.config import get_settings
 from app.db import models  # noqa: F401  (register metadata)
 from app.db.base import Base
@@ -526,4 +528,132 @@ async def graph_session(db: AsyncSession, monkeypatch: Any) -> None:
 
     monkeypatch.setattr(tenders_router, "with_session", lambda: _GraphSessionCtx())
     yield
+
+
+# ---- REQ-004 Risk Radar fixtures --------------------------------------------
+
+class _MockStructuredLLM:
+    """Mock structured-output LLM that returns a canned RiskRadarOutput or raises.
+
+    Tracks call_count so tests can verify retry behaviour without inspecting
+    log output or timing.
+    """
+
+    def __init__(
+        self,
+        return_value: RiskRadarOutput | None = None,
+        raise_exc: BaseException | None = None,
+    ) -> None:
+        self._return_value = return_value
+        self._raise_exc = raise_exc
+        self.call_count = 0
+
+    async def ainvoke(self, messages: list, config: dict | None = None, **kwargs: Any) -> Any:
+        self.call_count += 1
+        if self._raise_exc:
+            raise self._raise_exc
+        return self._return_value
+
+
+@pytest.fixture
+def sample_chunks() -> list[dict]:
+    """5 realistic chunk dicts matching the Ingestor output shape (REQ-004).
+
+    Includes one Arabic chunk so bilingual-dedup tests have a realistic source.
+    """
+    return [
+        {
+            "content": (
+                "The Contractor shall pay liquidated damages for delay in completion "
+                "at the rate of 0.1% of the Contract Price per day, up to a maximum "
+                "of 10% of the Contract Price."
+            ),
+            "detected_language": "en",
+            "chunk_index": 0,
+        },
+        {
+            "content": (
+                "The Performance Security shall be in the amount of 10% of the "
+                "Contract Price and shall be issued by a bank acceptable to the "
+                "Employer. The security shall remain valid until the issue of the "
+                "Taking-Over Certificate."
+            ),
+            "detected_language": "en",
+            "chunk_index": 1,
+        },
+        {
+            "content": (
+                "The Employer may terminate the Contract if the Contractor "
+                "subcontracts the whole of the Works without prior approval, "
+                "or becomes bankrupt or insolvent. Termination shall take effect "
+                "upon receipt of the notice."
+            ),
+            "detected_language": "en",
+            "chunk_index": 2,
+        },
+        {
+            "content": (
+                "يجب على المقاول تقديم خطاب ضمان حسن التنفيذ بنسبة 5% من قيمة العقد "
+                "ويكون ساري المفعول حتى تاريخ إصدار شهادة الاستلام الابتدائي"
+            ),
+            "detected_language": "ar",
+            "chunk_index": 3,
+        },
+        {
+            "content": (
+                "Any dispute arising out of or in connection with the Contract "
+                "shall be referred to arbitration in accordance with the Rules of "
+                "Arbitration of the International Chamber of Commerce."
+            ),
+            "detected_language": "en",
+            "chunk_index": 4,
+        },
+    ]
+
+
+@pytest_asyncio.fixture
+async def mock_llm(monkeypatch: Any) -> _MockStructuredLLM:
+    """Fixture: patches risk_radar._build_llm to return a canned valid output.
+
+    The mock returns two findings with all required fields populated.
+    """
+    findings = RiskRadarOutput(findings=[
+        RiskFinding(
+            category="penalty",
+            severity="high",
+            clause_text="0.1% of the Contract Price per day, up to a maximum of 10%",
+            explanation="Standard delay penalty within typical range",
+            source_chunk_index=0,
+            confidence=0.92,
+        ),
+        RiskFinding(
+            category="fidic",
+            severity="critical",
+            clause_text="The Employer may terminate the Contract if the Contractor subcontracts the whole of the Works without prior approval",
+            explanation="Uncapped termination right with no cure period",
+            source_chunk_index=2,
+            confidence=0.88,
+        ),
+    ])
+    mock = _MockStructuredLLM(return_value=findings)
+    monkeypatch.setattr("app.agents.nodes.risk_radar._build_llm", lambda: mock)
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_llm_malformed(monkeypatch: Any) -> _MockStructuredLLM:
+    """Fixture: patches risk_radar._build_llm to always fail schema validation."""
+    mock = _MockStructuredLLM(
+        raise_exc=OutputParserException("Failed to parse LLM output as RiskRadarOutput")
+    )
+    monkeypatch.setattr("app.agents.nodes.risk_radar._build_llm", lambda: mock)
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_llm_api_error(monkeypatch: Any) -> _MockStructuredLLM:
+    """Fixture: patches risk_radar._build_llm to raise API errors on every call."""
+    mock = _MockStructuredLLM(raise_exc=Exception("Simulated API connection error"))
+    monkeypatch.setattr("app.agents.nodes.risk_radar._build_llm", lambda: mock)
+    return mock
 

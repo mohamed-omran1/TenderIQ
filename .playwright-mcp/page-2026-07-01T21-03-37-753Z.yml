@@ -1,0 +1,229 @@
+- main [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e5]:
+      - link "OpenCode" [ref=e7] [cursor=pointer]:
+        - /url: /
+        - img "OpenCode" [ref=e8]
+      - navigation [ref=e9]:
+        - list [ref=e10]:
+          - listitem [ref=e11]:
+            - link "GitHub" [ref=e12] [cursor=pointer]:
+              - /url: https://github.com/anomalyco/opencode
+          - listitem [ref=e13]:
+            - link "Docs" [ref=e14] [cursor=pointer]:
+              - /url: /docs
+          - listitem [ref=e15]:
+            - link "Data" [ref=e16] [cursor=pointer]:
+              - /url: /data
+          - listitem [ref=e17]:
+            - link "Zen" [ref=e18] [cursor=pointer]:
+              - /url: /zen
+          - listitem [ref=e19]:
+            - link "Go" [ref=e20] [cursor=pointer]:
+              - /url: /go
+          - listitem [ref=e21]:
+            - link "Enterprise" [ref=e22] [cursor=pointer]:
+              - /url: /enterprise
+          - listitem [ref=e23]:
+            - link "Download" [ref=e24] [cursor=pointer]:
+              - /url: /download
+              - img [ref=e25]
+              - text: Download
+    - generic [ref=e27]:
+      - generic [ref=e28]:
+        - generic [ref=e29]:
+          - generic [ref=e30]: New
+          - generic [ref=e31]:
+            - generic [ref=e32]:
+              - text: Desktop app available in beta
+              - generic [ref=e33]: on macOS, Windows, and Linux
+              - text: .
+            - link "Download now" [ref=e34] [cursor=pointer]:
+              - /url: /download
+        - generic [ref=e35]:
+          - heading "The open source AI coding agent" [level=1] [ref=e36]
+          - paragraph [ref=e37]:
+            - text: Free models included or connect any model from any provider,
+            - text: including Claude, GPT, Gemini and more.
+        - region "Install options" [ref=e39]:
+          - tablist [ref=e40]:
+            - tab "curl" [selected] [ref=e41] [cursor=pointer]
+            - tab "npm" [ref=e42] [cursor=pointer]
+            - tab "bun" [ref=e43] [cursor=pointer]
+            - tab "brew" [ref=e44] [cursor=pointer]
+            - tab "paru" [ref=e45] [cursor=pointer]
+          - tabpanel [ref=e47]:
+            - button "curl -fsSL https://opencode.ai/install | bash" [ref=e48] [cursor=pointer]:
+              - generic [ref=e49]: curl -fsSL https://opencode.ai/install | bash
+              - img [ref=e51]
+      - generic [ref=e54]: Your browser does not support the video tag.
+      - generic [ref=e55]:
+        - generic [ref=e56]:
+          - heading "What is OpenCode?" [level=3] [ref=e57]
+          - paragraph [ref=e58]: OpenCode is an open source agent that helps you write code in your terminal, IDE, or desktop.
+        - list [ref=e59]:
+          - listitem [ref=e60]:
+            - generic [ref=e61]: "[*]"
+            - generic [ref=e62]:
+              - strong [ref=e63]: LSP enabled
+              - text: Automatically loads the right LSPs for the LLM
+          - listitem [ref=e64]:
+            - generic [ref=e65]: "[*]"
+            - generic [ref=e66]:
+              - strong [ref=e67]: Multi-session
+              - text: Start multiple agents in parallel on the same project
+          - listitem [ref=e68]:
+            - generic [ref=e69]: "[*]"
+            - generic [ref=e70]:
+              - strong [ref=e71]: Share links
+              - text: Share a link to any session for reference or to debug
+          - listitem [ref=e72]:
+            - generic [ref=e73]: "[*]"
+            - generic [ref=e74]:
+              - strong [ref=e75]: GitHub Copilot
+              - text: Log in with GitHub to use your Copilot account
+          - listitem [ref=e76]:
+            - generic [ref=e77]: "[*]"
+            - generic [ref=e78]:
+              - strong [ref=e79]: ChatGPT Plus/Pro
+              - text: Log in with OpenAI to use your ChatGPT Plus or Pro account
+          - listitem [ref=e80]:
+            - generic [ref=e81]: "[*]"
+            - generic [ref=e82]:
+              - strong [ref=e83]: Any model
+              - text: 75+ LLM providers through Models.dev, including local models
+          - listitem [ref=e84]:
+            - generic [ref=e85]: "[*]"
+            - generic [ref=e86]:
+              - strong [ref=e87]: Any editor
+              - text: Available as a terminal interface, desktop app, and IDE extension
+        - link "Read docs" [ref=e88] [cursor=pointer]:
+          - /url: /docs
+          - generic [ref=e89]: Read docs
+          - img [ref=e90]
+      - generic [ref=e93]:
+        - heading "The open source AI coding agent" [level=3] [ref=e94]
+        - generic [ref=e95]:
+          - generic [ref=e96]: "[*]"
+          - paragraph [ref=e97]:
+            - text: With over
+            - strong [ref=e98]: 160,000
+            - text: GitHub stars,
+            - strong [ref=e99]: "900"
+            - text: contributors, and over
+            - strong [ref=e100]: 13,000
+            - text: commits, OpenCode is used and trusted by over
+            - strong [ref=e101]: 7.5M
+            - text: developers every month.
+        - generic [ref=e102]:
+          - generic [ref=e103]:
+            - img [ref=e105]
+            - generic [ref=e110]:
+              - figure [ref=e111]: Fig 1.
+              - strong [ref=e112]: 160K
+              - text: GitHub Stars
+          - generic [ref=e113]:
+            - img [ref=e115]
+            - generic [ref=e399]:
+              - figure [ref=e400]: Fig 2.
+              - strong [ref=e401]: "900"
+              - text: Contributors
+          - generic [ref=e402]:
+            - img [ref=e404]
+            - generic [ref=e436]:
+              - figure [ref=e437]: Fig 3.
+              - strong [ref=e438]: 7.5M
+              - text: Monthly Devs
+      - generic [ref=e440]:
+        - heading "Built for privacy first" [level=3] [ref=e441]
+        - generic [ref=e442]:
+          - generic [ref=e443]: "[*]"
+          - paragraph [ref=e444]:
+            - text: OpenCode does not store any of your code or context data, so that it can operate in privacy sensitive environments. Learn more about
+            - link "privacy" [ref=e445] [cursor=pointer]:
+              - /url: /docs/enterprise/
+            - text: .
+      - generic [ref=e446]:
+        - heading "FAQ" [level=3] [ref=e448]
+        - list [ref=e449]:
+          - listitem [ref=e450]:
+            - button "What is OpenCode?" [ref=e452] [cursor=pointer]:
+              - img [ref=e453]
+              - generic [ref=e455]: What is OpenCode?
+          - listitem [ref=e456]:
+            - button "How do I use OpenCode?" [ref=e458] [cursor=pointer]:
+              - img [ref=e459]
+              - generic [ref=e461]: How do I use OpenCode?
+          - listitem [ref=e462]:
+            - button "Do I need extra AI subscriptions to use OpenCode?" [ref=e464] [cursor=pointer]:
+              - img [ref=e465]
+              - generic [ref=e467]: Do I need extra AI subscriptions to use OpenCode?
+          - listitem [ref=e468]:
+            - button "Can I use my existing AI subscriptions with OpenCode?" [ref=e470] [cursor=pointer]:
+              - img [ref=e471]
+              - generic [ref=e473]: Can I use my existing AI subscriptions with OpenCode?
+          - listitem [ref=e474]:
+            - button "Can I only use OpenCode in the terminal?" [ref=e476] [cursor=pointer]:
+              - img [ref=e477]
+              - generic [ref=e479]: Can I only use OpenCode in the terminal?
+          - listitem [ref=e480]:
+            - button "How much does OpenCode cost?" [ref=e482] [cursor=pointer]:
+              - img [ref=e483]
+              - generic [ref=e485]: How much does OpenCode cost?
+          - listitem [ref=e486]:
+            - button "What about data and privacy?" [ref=e488] [cursor=pointer]:
+              - img [ref=e489]
+              - generic [ref=e491]: What about data and privacy?
+          - listitem [ref=e492]:
+            - button "Is OpenCode open source?" [ref=e494] [cursor=pointer]:
+              - img [ref=e495]
+              - generic [ref=e497]: Is OpenCode open source?
+      - generic [ref=e499]:
+        - strong [ref=e500]: Access reliable optimized models for coding agents
+        - paragraph [ref=e501]: Zen gives you access to a handpicked set of AI models that OpenCode has tested and benchmarked specifically for coding agents. No need to worry about inconsistent performance and quality across providers, use validated models that work.
+        - generic [ref=e502]:
+          - img [ref=e504]
+          - img [ref=e508]
+          - img [ref=e512]
+          - img [ref=e515]
+          - img [ref=e519]
+          - img [ref=e522]
+          - img [ref=e525]
+        - link "Learn about Zen" [ref=e527] [cursor=pointer]:
+          - /url: /zen
+          - generic [ref=e528]: Learn about Zen
+          - img [ref=e529]
+      - generic [ref=e531]:
+        - generic [ref=e532]:
+          - heading "Be the first to know when we release new products" [level=3] [ref=e533]
+          - paragraph [ref=e534]: Join the waitlist for early access.
+        - generic [ref=e535]:
+          - textbox "Email address" [ref=e536]
+          - button "Subscribe" [ref=e537] [cursor=pointer]
+      - generic [ref=e538]:
+        - link "GitHub [160K]" [ref=e540] [cursor=pointer]:
+          - /url: https://github.com/anomalyco/opencode
+          - text: GitHub
+          - generic [ref=e541]: "[160K]"
+        - link "Docs" [ref=e543] [cursor=pointer]:
+          - /url: /docs
+        - link "Changelog" [ref=e545] [cursor=pointer]:
+          - /url: /changelog
+        - link "Discord" [ref=e547] [cursor=pointer]:
+          - /url: /discord
+        - link "X" [ref=e549] [cursor=pointer]:
+          - /url: https://x.com/opencode
+  - generic [ref=e550]:
+    - generic [ref=e551]:
+      - text: ©2026
+      - link "Anomaly" [ref=e552] [cursor=pointer]:
+        - /url: https://anoma.ly
+    - link "Brand" [ref=e554] [cursor=pointer]:
+      - /url: /brand
+    - link "Privacy" [ref=e556] [cursor=pointer]:
+      - /url: /legal/privacy-policy
+    - link "Terms" [ref=e558] [cursor=pointer]:
+      - /url: /legal/terms-of-service
+    - button "English" [ref=e562] [cursor=pointer]:
+      - generic [ref=e563]: English
+      - img [ref=e564]

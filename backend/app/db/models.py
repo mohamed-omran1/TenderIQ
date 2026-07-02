@@ -295,6 +295,12 @@ class AnalysisRun(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    risk_findings: Mapped[list["RiskFinding"]] = relationship(
+        "RiskFinding",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -303,6 +309,55 @@ class AnalysisRun(Base):
         ),
         # Status polling always looks up the latest run for a tender.
         Index("ix_analysis_runs_tender_started", "tender_id", "started_at"),
+    )
+
+
+class RiskFinding(Base):
+    """One risk-bearing clause identified by the Risk Radar (REQ-004 Slice 3).
+
+    Written in a single batch when the parent analysis_run transitions to
+    "awaiting_hitl" (never incrementally during the LLM call) so a retry never
+    produces duplicate rows. clause_text and explanation are commercially
+    sensitive tender content — they must never appear in application logs
+    (REQ-004 Security NFR), only here in the persisted table.
+    """
+
+    __tablename__ = "risk_findings"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, server_default=text("gen_random_uuid()::text")
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("analysis_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    category: Mapped[str] = mapped_column(String(32), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    clause_text: Mapped[str] = mapped_column(Text, nullable=False)
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    source_chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+
+    run: Mapped[AnalysisRun] = relationship("AnalysisRun", back_populates="risk_findings")
+
+    __table_args__ = (
+        CheckConstraint(
+            "category IN ('fidic', 'penalty', 'lg_bond', 'termination', 'other')",
+            name="risk_findings_category_check",
+        ),
+        CheckConstraint(
+            "severity IN ('critical', 'high', 'medium', 'low')",
+            name="risk_findings_severity_check",
+        ),
+        CheckConstraint(
+            "confidence >= 0.0 AND confidence <= 1.0",
+            name="risk_findings_confidence_range",
+        ),
+        # GET /tenders/{id}/findings always filters by run_id.
+        Index("ix_risk_findings_run_id", "run_id"),
+        # Severity-filtered queries (e.g. "all critical findings for this run").
+        Index("ix_risk_findings_run_severity", "run_id", "severity"),
     )
 
 

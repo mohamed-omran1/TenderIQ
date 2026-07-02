@@ -1,8 +1,11 @@
-"""Tenders router — POST /tenders/upload and GET /tenders/{id}.
+"""Tenders router — POST /tenders/upload, GET /tenders/{id}, and analysis-run endpoints.
 
 Implements REQ-001 Main Flow steps 1–5 and 10:
   upload validates + stores + inserts row + schedules ingestion, returns 202.
   get_status is tenant-scoped polling for `ready` / `failed`.
+
+Also implements REQ-003 (analyse + status) and REQ-004 Slice 3 (findings
+persistence + GET /tenders/{id}/findings).
 """
 
 from __future__ import annotations
@@ -21,18 +24,22 @@ from fastapi import (
     UploadFile,
     status,
 )
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.ingestion import run_ingestion
 from app.agents.state import TenderState
 from app.config import Settings, get_settings
-from app.db.models import AnalysisRun, Company, Tender, TenderChunk
+from app.db.models import AnalysisRun, Company, RiskFinding, Tender, TenderChunk
 from app.db.session import get_session, with_session
 from app.errors import NotFound, QuotaExceeded, RateLimited
 from app.middleware.auth import get_current_company
 from app.middleware.rate_limit import check_rate_limit
-from app.schemas.analysis import AnalyseResponse, RunStatusResponse
+from app.schemas.analysis import (
+    AnalyseResponse,
+    RiskFindingResponse,
+    RunStatusResponse,
+)
 from app.schemas.tender import TenderDetailResponse, TenderUploadResponse
 from app.services.storage import save_upload
 from app.services.validation import reject_oversize_declared, sanitize_filename, validate_upload
@@ -117,10 +124,53 @@ async def run_graph(
 
             if saw_aggregator:
                 # Graph reached the interrupt_before=["report_assembler"] gate.
+                # Persist the risk findings produced by the Risk Radar in the
+                # SAME transaction as the state transition to "awaiting_hitl"
+                # — if the INSERT fails, the state must NOT move forward
+                # (REQ-004 Slice 3 atomicity rule).
+                #
+                # We read the final state from the checkpoint rather than
+                # relying on the in-loop event payloads, because the
+                # aggregator's output is the source of truth for the
+                # consolidated `risk_findings` list and is captured at the
+                # last reducer write.
+                final_checkpoint = await graph.aget_state(config)
+                findings_dicts = (
+                    final_checkpoint.values.get("risk_findings", [])
+                    if final_checkpoint is not None
+                    else []
+                ) or []
+
+                if findings_dicts:
+                    await db.execute(
+                        insert(RiskFinding).values([
+                            {
+                                "run_id": run_id,
+                                "category": f["category"],
+                                "severity": f["severity"],
+                                "clause_text": f["clause_text"],
+                                "explanation": f["explanation"],
+                                "source_chunk_index": f["source_chunk_index"],
+                                "confidence": f["confidence"],
+                            }
+                            for f in findings_dicts
+                        ])
+                    )
+
                 await db.execute(
                     update(AnalysisRun)
                     .where(AnalysisRun.id == run_id)
                     .values(state="awaiting_hitl")
+                )
+                # Single commit — INSERT (if any) + UPDATE land atomically.
+                await db.commit()
+
+                # Log metadata only — NEVER clause_text or explanation
+                # (REQ-004 Security NFR, ai-security T5).
+                logger.info(
+                    "analysis_run_awaiting_hitl run_id=%s finding_count=%d",
+                    run_id,
+                    len(findings_dicts),
                 )
             else:
                 # The graph was interrupted before aggregation (e.g., supervisor
@@ -133,7 +183,7 @@ async def run_graph(
                         error_reason="Graph interrupted before aggregation completed.",
                     )
                 )
-            await db.commit()
+                await db.commit()
         except Exception as e:
             logger.exception("analysis_run_failed run_id=%s", run_id)
             try:
@@ -366,3 +416,62 @@ async def get_analysis_status(
         error_reason=run.error_reason,
         agent_trace=run.agent_trace or {},
     )
+
+
+@router.get(
+    "/{tender_id}/findings",
+    response_model=list[RiskFindingResponse],
+    summary="Get the Risk Radar findings for a tender's latest analysis run.",
+)
+async def get_findings(
+    tender_id: Annotated[str, Path()],
+    company: CompanyDep,
+    session: SessionDep,
+) -> list[RiskFindingResponse]:
+    """Return risk findings for the latest analysis run, tenant-scoped.
+
+    Ordering: critical -> high -> medium -> low, then by `confidence` DESC
+    within each severity group (a CASE expression preserves the enum's
+    business ordering that an alphabetical sort would scramble).
+    """
+    # a) + b) Latest analysis run for this tender.
+    result = await session.execute(
+        select(AnalysisRun)
+        .where(AnalysisRun.tender_id == tender_id)
+        .order_by(AnalysisRun.started_at.desc())
+        .limit(1)
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No analysis run found for this tender.",
+        )
+
+    # c) Authorisation — the run carries its own company_id for tenant scoping.
+    # 403 (not 404) here is intentional: the run exists, the caller just
+    # belongs to a different tenant. Compare with get_analysis_status above
+    # which returns 404 only when the run itself is missing.
+    if run.company_id != company.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorised to view findings for this tender.",
+        )
+
+    # d) Findings for this run, ordered by severity then confidence DESC.
+    # The CASE expression keeps the fixed business ordering of the severity
+    # enum (critical first); an ORDER BY severity ASC would put 'critical'
+    # last because 'c' < 'h' < 'l' < 'm' alphabetically.
+    severity_order = case(
+        (RiskFinding.severity == "critical", 1),
+        (RiskFinding.severity == "high", 2),
+        (RiskFinding.severity == "medium", 3),
+        (RiskFinding.severity == "low", 4),
+        else_=5,
+    )
+    findings_result = await session.execute(
+        select(RiskFinding)
+        .where(RiskFinding.run_id == run.id)
+        .order_by(severity_order.asc(), RiskFinding.confidence.desc())
+    )
+    return [RiskFindingResponse.model_validate(f) for f in findings_result.scalars().all()]
