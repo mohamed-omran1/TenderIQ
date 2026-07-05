@@ -30,6 +30,7 @@ class RunStatusResponse(BaseModel):
     started_at: datetime
     completed_at: datetime | None = None
     error_reason: str | None = None
+    feasibility_score: float | None = None
     agent_trace: dict = Field(default_factory=dict)
 
 

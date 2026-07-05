@@ -160,7 +160,12 @@ async def run_graph(
                 await db.execute(
                     update(AnalysisRun)
                     .where(AnalysisRun.id == run_id)
-                    .values(state="awaiting_hitl")
+                    .values(
+                        state="awaiting_hitl",
+                        feasibility_score=final_checkpoint.values.get(
+                            "feasibility_score"
+                        ),
+                    )
                 )
                 # Single commit — INSERT (if any) + UPDATE land atomically.
                 await db.commit()
@@ -414,6 +419,7 @@ async def get_analysis_status(
         started_at=run.started_at,
         completed_at=run.completed_at,
         error_reason=run.error_reason,
+        feasibility_score=run.feasibility_score,
         agent_trace=run.agent_trace or {},
     )
 

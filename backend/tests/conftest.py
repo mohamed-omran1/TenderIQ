@@ -26,6 +26,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 # `fakeredis` provides an in-process async Redis for deterministic rate-limit tests.
 import fakeredis.aioredis
 
+from app.agents.skills.feasibility_scoring import (
+    DimensionScore,
+    FeasibilityOutput,
+    SCOPE_ANCHOR_QUERIES,
+)
 from app.agents.skills.risk_clause_extraction import RiskFinding, RiskRadarOutput
 from app.config import get_settings
 from app.db import models  # noqa: F401  (register metadata)
@@ -656,4 +661,195 @@ async def mock_llm_api_error(monkeypatch: Any) -> _MockStructuredLLM:
     mock = _MockStructuredLLM(raise_exc=Exception("Simulated API connection error"))
     monkeypatch.setattr("app.agents.nodes.risk_radar._build_llm", lambda: mock)
     return mock
+
+
+# ---- REQ-005 Feasibility Scorer fixtures -----------------------------------
+
+class _MockFeasibilityLLM:
+    """Mock structured-output LLM that returns a canned FeasibilityOutput or raises.
+
+    Tracks call_count so tests can verify retry behaviour without inspecting
+    log output or timing. Mirrors the _MockStructuredLLM pattern used for
+    risk_radar (REQ-004).
+    """
+
+    def __init__(
+        self,
+        return_value: FeasibilityOutput | None = None,
+        raise_exc: BaseException | None = None,
+    ) -> None:
+        self._return_value = return_value
+        self._raise_exc = raise_exc
+        self.call_count = 0
+
+    async def ainvoke(
+        self, messages: list, config: dict | None = None, **kwargs: Any
+    ) -> Any:
+        self.call_count += 1
+        if self._raise_exc:
+            raise self._raise_exc
+        return self._return_value
+
+
+@pytest_asyncio.fixture
+async def mock_feasibility_llm(monkeypatch: Any) -> _MockFeasibilityLLM:
+    """Fixture: patches feasibility_scorer._build_llm to return a FeasibilityOutput.
+
+    Uses varied scores including one above 20 (timeline=25) and one below 0
+    (geographic_scope=-3) to test clamping.  Uses model_construct to bypass
+    Pydantic field-level validation for the out-of-range values.
+    """
+    output = FeasibilityOutput.model_construct(**{
+        "technical_fit": DimensionScore.model_construct(
+            score=18,
+            rationale="Company specialisations of civil and roads cover the tender scope of highway construction.",
+        ),
+        "financial_capacity": DimensionScore.model_construct(
+            score=14,
+            rationale="Tender value is within company max_project_value and bonding capacity is adequate.",
+        ),
+        "timeline": DimensionScore.model_construct(
+            score=25,
+            rationale="Tender duration of 24 months is well within the company's demonstrated capability.",
+        ),
+        "geographic_scope": DimensionScore.model_construct(
+            score=-3,
+            rationale="Tender location in SA matches company geographic_reach of SA.",
+        ),
+        "past_experience": DimensionScore.model_construct(
+            score=12,
+            rationale="Company has 2 past_projects in roads and civil sectors covering similar scope.",
+        ),
+    })
+    mock = _MockFeasibilityLLM(return_value=output)
+    monkeypatch.setattr(
+        "app.agents.nodes.feasibility_scorer._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_feasibility_llm_malformed(
+    monkeypatch: Any,
+) -> _MockFeasibilityLLM:
+    """Fixture: patches feasibility_scorer._build_llm to fail schema validation."""
+    mock = _MockFeasibilityLLM(
+        raise_exc=OutputParserException(
+            "Failed to parse LLM output as FeasibilityOutput"
+        )
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.feasibility_scorer._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_feasibility_llm_api_error(
+    monkeypatch: Any,
+) -> _MockFeasibilityLLM:
+    """Fixture: patches feasibility_scorer._build_llm to raise API errors."""
+    mock = _MockFeasibilityLLM(
+        raise_exc=Exception("Simulated API connection error")
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.feasibility_scorer._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def company_profile_fixture(
+    db: AsyncSession, company_a: tuple[Company, str]
+) -> tuple[Company, str]:
+    """Company with a fully populated profile (all 6 fields of CompanyProfileSchema).
+
+    Includes non-empty past_projects and all financial_capacity sub-fields
+    so the feasibility scorer can score all 5 dimensions (REQ-005 Slice 5).
+    """
+    company, raw_key = company_a
+    profile = CompanyProfile(
+        company_id=company.id,
+        specializations=["civil", "roads"],
+        financial_capacity={
+            "currency": "SAR",
+            "annual_turnover": 1_000_000,
+            "available_bonding_capacity": 500_000,
+        },
+        geographic_reach=["SA"],
+        past_projects=[
+            {
+                "name": "Road Project Alpha",
+                "value": 300_000,
+                "year": 2024,
+                "sector": "roads",
+            },
+            {
+                "name": "Civil Works Beta",
+                "value": 200_000,
+                "year": 2023,
+                "sector": "civil",
+            },
+        ],
+        max_project_value=500_000,
+    )
+    db.add(profile)
+    await db.flush()
+    return company, raw_key
+
+
+@pytest.fixture
+def sample_scope_chunks() -> list[dict]:
+    """5 chunk dicts covering project scope, value, timeline, location, qualifications.
+
+    Matches the SCOPE_ANCHOR_QUERIES structure from feasibility_scoring.py
+    (project description, contract value, timeline, location, qualifications).
+    """
+    return [
+        {
+            "content": (
+                "The project involves the construction of a 15km highway connecting "
+                "the industrial zone to the main port. Scope includes earthworks, "
+                "paving, drainage systems, and lighting."
+            ),
+            "detected_language": "en",
+            "chunk_index": 0,
+        },
+        {
+            "content": (
+                "The estimated contract value is SAR 45,000,000. The Employer will "
+                "require a performance bond of 10% of the contract value upon award."
+            ),
+            "detected_language": "en",
+            "chunk_index": 1,
+        },
+        {
+            "content": (
+                "The project duration is 24 months from the date of commencement. "
+                "Expected completion date is December 2027. An early completion "
+                "bonus of SAR 500,000 is available."
+            ),
+            "detected_language": "en",
+            "chunk_index": 2,
+        },
+        {
+            "content": (
+                "The project is located in the Eastern Province of Saudi Arabia, "
+                "approximately 50km from Dammam. Site access will be provided "
+                "by the Employer."
+            ),
+            "detected_language": "en",
+            "chunk_index": 3,
+        },
+        {
+            "content": (
+                "Contractors must have at least 10 years of experience in highway "
+                "construction, a valid SAGMA classification in roadworks Grade A, "
+                "and must have completed at least two projects of similar value "
+                "in the GCC region."
+            ),
+            "detected_language": "en",
+            "chunk_index": 4,
+        },
+    ]
 

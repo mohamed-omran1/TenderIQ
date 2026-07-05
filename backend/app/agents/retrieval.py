@@ -1,17 +1,30 @@
-"""Anchor-query pgvector retrieval for the Risk Radar node (REQ-004 Slice 2).
+"""Anchor-query retrieval for the Feasibility Scorer and Risk Radar nodes
+(REQ-005 Slice 2, REQ-004 Slice 2).
 
-This module is the one piece of retrieval logic that the Risk Radar node uses
-to surface risk-bearing chunks from a tender. It runs a small fixed set of
-hand-curated "risk anchor" queries against the tender's chunks in pgvector,
-rather than sending the entire tender to the LLM. This keeps token usage
-proportional to risk density, not document length (REQ-004 Main Flow step 2).
+This module exposes two retrieval strategies that share the same underlying
+embedding client + cosine-similarity algorithm but use different anchor
+queries and different output shapes:
 
-The `chunks` argument is part of the function contract (see imp-slice-02) and
-is also used as a defensive fallback if the database has no embedded rows for
-this tender. In the normal case the in-memory chunks and the
-`tender_chunks` table hold the same content; the DB is the source of truth
-because it carries the pre-computed embeddings produced by the Ingestor
-(REQ-001).
+  * `retrieve_risk_relevant_chunks` (REQ-004 Slice 2) — risk-bearing clauses.
+  * `retrieve_scope_relevant_chunks` (REQ-005 Slice 2) — tender-scope chunks
+    (project description, value, timeline, location, qualifications).
+
+The two strategies are intentionally separate (REQ-005 Description: "These
+two retrieval strategies are intentionally different and must not be
+merged"). The Feasibility Scorer needs project-scope chunks; the Risk Radar
+needs risk-bearing clauses. Mixing them would degrade both.
+
+For the Risk Radar path (DB-backed), the `chunks` argument is also used as
+a defensive fallback if the database has no embedded rows for this tender.
+In the normal case the in-memory chunks and the `tender_chunks` table hold
+the same content; the DB is the source of truth because it carries the
+pre-computed embeddings produced by the Ingestor (REQ-001).
+
+For the Feasibility Scorer path (in-memory), the function operates directly
+on the in-memory chunks — the slice-spec signature is `retrieve_scope_
+relevant_chunks(tender_id, chunks, top_k_per_query)`, intentionally narrow,
+and the alternative-flow fallback returns the first 20 chunks by
+chunk_index from the same in-memory list.
 """
 from __future__ import annotations
 
@@ -215,3 +228,147 @@ async def retrieve_risk_relevant_chunks(
             return []
 
     return await _retrieve_via_memory(chunks, query_vectors, top_k_per_query)
+
+
+# ---------------------------------------------------------------------------
+# Feasibility Scorer — tender-scope retrieval (REQ-005 Slice 2)
+# ---------------------------------------------------------------------------
+# Imported here (not at module top) to avoid a cycle: feasibility_scoring
+# is a pure-data skill package and must not import from this module.
+from app.agents.skills.feasibility_scoring import (  # noqa: E402
+    SCOPE_ANCHOR_QUERIES,
+)
+
+
+def _scope_fallback(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """First 20 chunks by chunk_index, in the spec's output shape.
+
+    REQ-005 Alt Flow "No scope-relevant chunks found by retrieval":
+    "Score on the full chunk set (first 20 chunks, ordered by chunk_index)
+    rather than returning 0 — a tender with no obvious scope description is
+    still scoreable on available content."
+
+    Output dict shape: {content, detected_language, chunk_index}.
+    """
+    sorted_chunks = sorted(chunks, key=lambda c: c.get("chunk_index", 0))[:20]
+    return [
+        {
+            "content": c.get("content", ""),
+            "detected_language": c.get("detected_language", ""),
+            "chunk_index": c.get("chunk_index", 0),
+        }
+        for c in sorted_chunks
+    ]
+
+
+async def retrieve_scope_relevant_chunks(
+    tender_id: str,
+    chunks: list[dict],
+    top_k_per_query: int = 4,
+) -> list[dict]:
+    """Return chunks most likely to contain tender-scope information.
+
+    Runs each of `SCOPE_ANCHOR_QUERIES` (imported from
+    `app.agents.skills.feasibility_scoring`) against the in-memory `chunks`
+    list using the same Gemini embeddings client + cosine-similarity
+    algorithm as `retrieve_risk_relevant_chunks` (REQ-004 Slice 2), and
+    returns the union of the top `top_k_per_query` results per query,
+    deduplicated by `chunk_index`.
+
+    The signature matches the slice spec exactly — no `company_id` argument,
+    no `embeddings` injection. The function operates on the in-memory
+    chunks passed by the supervisor, which are already tenant-scoped by
+    the Ingestor. Output dict shape is the same as the input chunks:
+    {content, detected_language, chunk_index}. No duplicate chunk_index
+    values are ever returned.
+
+    Per REQ-005 Alt Flow "No scope-relevant chunks found by retrieval":
+    if the retrieval yields nothing (or the embedding client fails), this
+    function returns the first 20 chunks ordered by chunk_index — never an
+    empty list when `chunks` is non-empty. The Feasibility Scorer can
+    therefore always proceed to scoring on at least the chunk-set baseline.
+
+    Args:
+        tender_id: UUID of the tender (carried in the signature for parity
+            with `retrieve_risk_relevant_chunks`; used only for log
+            metadata — the in-memory path is already scope-bound by the
+            supervisor).
+        chunks: In-memory chunks to search. The slice spec mandates the
+            in-memory path; tenant isolation is guaranteed upstream.
+        top_k_per_query: Per-anchor-query top-K. Default 4 per the slice
+            spec.
+
+    Returns:
+        List of chunk dicts with keys `content`, `detected_language`,
+        `chunk_index`. Ordered by ascending `chunk_index`. Never empty
+        when `chunks` is non-empty (the fallback kicks in otherwise).
+    """
+    if not chunks:
+        return []
+    if not SCOPE_ANCHOR_QUERIES:
+        return _scope_fallback(chunks)
+
+    embeddings = get_embeddings_client()
+    try:
+        query_vectors = embeddings.embed_documents(list(SCOPE_ANCHOR_QUERIES))
+    except EmbeddingUnavailable as exc:
+        logger.warning(
+            "scope_retrieval_embedding_unavailable tender_id=%s reason=%s",
+            tender_id,
+            type(exc).__name__,
+        )
+        return _scope_fallback(chunks)
+    except Exception as exc:  # noqa: BLE001
+        # Non-fatal helper — surface nothing rather than crashing the whole
+        # graph run. Fall back to the chunk-set baseline.
+        logger.warning(
+            "scope_retrieval_embedding_failed tender_id=%s reason=%s",
+            tender_id,
+            type(exc).__name__,
+        )
+        return _scope_fallback(chunks)
+
+    # Embed the chunks (caller has not pre-computed vectors — same as
+    # the existing `_retrieve_via_memory` path).
+    chunk_texts = [c.get("content", "") for c in chunks]
+    try:
+        chunk_vecs = embeddings.embed_documents(chunk_texts)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "scope_retrieval_chunk_embedding_failed tender_id=%s reason=%s",
+            tender_id,
+            type(exc).__name__,
+        )
+        return _scope_fallback(chunks)
+
+    scored: list[tuple[float, int, dict[str, Any]]] = []
+    for q_vec in query_vectors:
+        per_query = sorted(
+            (
+                (_cosine_similarity(q_vec, c_vec), c_idx, c)
+                for c_idx, (c_vec, c) in enumerate(zip(chunk_vecs, chunks))
+            ),
+            key=lambda t: t[0],
+            reverse=True,
+        )[:top_k_per_query]
+        scored.extend(per_query)
+
+    # Union by chunk_index, keeping the best (highest) similarity per index.
+    best_by_index: dict[int, tuple[float, dict[str, Any]]] = {}
+    for score, _c_idx, chunk in scored:
+        c_idx = chunk.get("chunk_index", _c_idx)
+        existing = best_by_index.get(c_idx)
+        if existing is None or score > existing[0]:
+            best_by_index[c_idx] = (score, chunk)
+
+    if not best_by_index:
+        return _scope_fallback(chunks)
+
+    return [
+        {
+            "content": chunk.get("content", ""),
+            "detected_language": chunk.get("detected_language", ""),
+            "chunk_index": chunk.get("chunk_index", c_idx),
+        }
+        for c_idx, (_score, chunk) in sorted(best_by_index.items())
+    ]
