@@ -1,0 +1,31 @@
+- generic [active] [ref=f2e1]:
+  - main [ref=f2e2]:
+    - generic [ref=f2e3]:
+      - heading "Risk Analysis Report" [level=1] [ref=f2e4]
+      - paragraph [ref=f2e5]: "Tender ID: 44444444-4444-4444-4444-444444444444"
+    - generic [ref=f2e6]:
+      - img [ref=f2e7]
+      - paragraph [ref=f2e9]: This is a preliminary risk review. The full Go/No-Go report will be available after your review and approval below.
+    - generic [ref=f2e96]: No risk clauses identified in this tender.
+    - generic [ref=f2e16]:
+      - generic [ref=f2e18]: Feasibility Score
+      - generic [ref=f2e19]:
+        - generic "Loading dimension breakdown" [ref=f2e24]
+        - generic [ref=f2e55]:
+          - generic [ref=f2e56]:
+            - img [ref=f2e57]
+            - paragraph [ref=f2e59]: This score is pending your review. You can adjust it before the final report is generated.
+          - generic [ref=f2e60]:
+            - button "Approve & Adjust Score" [disabled]
+          - paragraph [ref=f2e61]: HITL approval — coming in REQ-007
+    - generic [ref=f2e97]:
+      - generic [ref=f2e99]: Financial Summary
+      - generic [ref=f2e101]:
+        - img [ref=f2e102]
+        - paragraph [ref=f2e104]: No financial commitments identified in this tender.
+    - generic [ref=f2e85]:
+      - paragraph [ref=f2e86]: HITL approval — coming in REQ-007
+      - button "Approve & Generate Full Report" [disabled]
+  - button "Open Next.js Dev Tools" [ref=f2e92] [cursor=pointer]:
+    - img [ref=f2e93]
+  - alert [ref=f2e105]

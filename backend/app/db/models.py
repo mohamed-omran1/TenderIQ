@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     Float,
@@ -301,6 +302,12 @@ class AnalysisRun(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    financial_commitments: Mapped[list["FinancialCommitment"]] = relationship(
+        "FinancialCommitment",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
     __table_args__ = (
         CheckConstraint(
@@ -391,6 +398,65 @@ class LlmCostEvent(Base):
     run: Mapped[AnalysisRun] = relationship("AnalysisRun", back_populates="cost_events")
 
     __table_args__ = (Index("ix_llm_cost_events_run_id", "run_id"),)
+
+
+class FinancialCommitment(Base):
+    """One row per financial commitment item (REQ-006 Slice 3 Persistence).
+
+    Flattens the structured output of the Financial Analyst node (REQ-006
+    Slice 2) into one row per item across all categories: contract_value,
+    bond, liquidated_damages, payment_milestone, retention, advance_payment.
+
+    Written in a single batch when the parent analysis_run transitions to
+    "awaiting_hitl" (never incrementally during the LLM call) so a retry
+    never produces duplicate rows. The `_flatten_financial_summary` helper
+    in `routers/tenders.py` does the nested-dict -> row-list translation
+    inside the same atomic commit block that persists risk_findings and
+    the state transition (REQ-006 Slice 3 atomicity rule).
+
+    `amount_value` and `amount_currency` are commercially sensitive tender
+    content (REQ-006 Security NFR) and must never appear in application
+    logs; they are only persisted in this table.
+    """
+
+    __tablename__ = "financial_commitments"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, server_default=text("gen_random_uuid()::text")
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("analysis_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    commitment_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    amount_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    amount_currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    percentage: Mapped[float | None] = mapped_column(Float, nullable=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    needs_review: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    source_chunk_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    run: Mapped[AnalysisRun] = relationship(
+        "AnalysisRun", back_populates="financial_commitments"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "commitment_type IN ("
+            "'bond', 'liquidated_damages', 'payment_milestone', "
+            "'retention', 'advance_payment', 'contract_value')",
+            name="financial_commitments_commitment_type_check",
+        ),
+        # GET /tenders/{id}/financial always filters by run_id.
+        Index("ix_financial_commitments_run_id", "run_id"),
+        # Per-type rollups inside a run (e.g. all bonds for this run).
+        Index("ix_financial_commitments_run_type", "run_id", "commitment_type"),
+        # Fast query for items flagged for analyst review.
+        Index("ix_financial_commitments_run_review", "run_id", "needs_review"),
+    )
 
 
 # Add the (tender_id, chunk_index) uniqueness as a separate Index to keep

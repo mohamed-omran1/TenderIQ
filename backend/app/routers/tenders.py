@@ -4,15 +4,17 @@ Implements REQ-001 Main Flow steps 1–5 and 10:
   upload validates + stores + inserts row + schedules ingestion, returns 202.
   get_status is tenant-scoped polling for `ready` / `failed`.
 
-Also implements REQ-003 (analyse + status) and REQ-004 Slice 3 (findings
-persistence + GET /tenders/{id}/findings).
+Also implements REQ-003 (analyse + status), REQ-004 Slice 3 (findings
+persistence + GET /tenders/{id}/findings), REQ-005 Slice 3 (feasibility
+score persistence in the same atomic commit block), and REQ-006 Slice 3
+(financial commitments persistence + GET /tenders/{id}/financial).
 """
 
 from __future__ import annotations
 
 import logging
 from typing import Annotated
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import (
     APIRouter,
@@ -30,13 +32,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.ingestion import run_ingestion
 from app.agents.state import TenderState
 from app.config import Settings, get_settings
-from app.db.models import AnalysisRun, Company, RiskFinding, Tender, TenderChunk
+from app.db.models import (
+    AnalysisRun,
+    Company,
+    FinancialCommitment,
+    RiskFinding,
+    Tender,
+    TenderChunk,
+)
 from app.db.session import get_session, with_session
 from app.errors import NotFound, QuotaExceeded, RateLimited
 from app.middleware.auth import get_current_company
 from app.middleware.rate_limit import check_rate_limit
 from app.schemas.analysis import (
     AnalyseResponse,
+    FinancialCommitmentResponse,
     RiskFindingResponse,
     RunStatusResponse,
 )
@@ -51,6 +61,133 @@ router = APIRouter(prefix="/tenders", tags=["tenders"])
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 CompanyDep = Annotated[Company, Depends(get_current_company)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
+
+
+def _flatten_financial_summary(
+    summary: dict, run_id: UUID
+) -> list[dict]:
+    """Convert the nested financial_summary dict into a flat row-list.
+
+    One row per commitment item across all categories — ready for bulk
+    INSERT into financial_commitments. Pure synchronous transformation:
+    no async, no DB calls, no I/O.
+
+    Rules (REQ-006 Slice 3):
+      - Always include run_id in every row dict.
+      - Skip any item where the source field is None/null
+        (e.g. if contract_value is None, skip it).
+      - Never raise — wrap in try/except and return [] on any
+        unexpected error (log the error with run_id, no values).
+    """
+    try:
+        rows: list[dict] = []
+
+        contract_value = summary.get("contract_value")
+        if contract_value:
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "commitment_type": "contract_value",
+                    "amount_value": contract_value.get("value"),
+                    "amount_currency": contract_value.get("currency"),
+                    "percentage": None,
+                    "description": "Contract value",
+                    "needs_review": bool(contract_value.get("needs_review", False)),
+                    "source_chunk_index": None,
+                }
+            )
+
+        for bond in summary.get("bonds", []) or []:
+            amount = bond.get("amount") or {}
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "commitment_type": "bond",
+                    "amount_value": amount.get("value"),
+                    "amount_currency": amount.get("currency"),
+                    "percentage": bond.get("percentage"),
+                    "description": bond.get("conditions", ""),
+                    "needs_review": bool(amount.get("needs_review", False)),
+                    "source_chunk_index": bond.get("source_chunk_index"),
+                }
+            )
+
+        ld = summary.get("liquidated_damages")
+        if ld:
+            rate = ld.get("rate") or {}
+            cap = ld.get("cap") or {}
+            cap_value = cap.get("value") if cap else None
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "commitment_type": "liquidated_damages",
+                    "amount_value": rate.get("value"),
+                    "amount_currency": rate.get("currency"),
+                    "percentage": ld.get("cap_percentage"),
+                    "description": (
+                        f"LD rate: {ld.get('period', '')}. "
+                        f"Cap: {cap_value if cap_value is not None else 'None'}"
+                    ),
+                    "needs_review": bool(rate.get("needs_review", False)),
+                    "source_chunk_index": ld.get("source_chunk_index"),
+                }
+            )
+
+        for milestone in summary.get("payment_schedule", []) or []:
+            amount = milestone.get("amount") or {}
+            has_amount = bool(amount)
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "commitment_type": "payment_milestone",
+                    "amount_value": amount.get("value") if has_amount else None,
+                    "amount_currency": amount.get("currency") if has_amount else None,
+                    "percentage": milestone.get("percentage"),
+                    "description": f"{milestone.get('description', '')} — {milestone.get('trigger', '')}",
+                    "needs_review": bool(amount.get("needs_review", False)) if has_amount else False,
+                    "source_chunk_index": None,
+                }
+            )
+
+        retention_rate = summary.get("retention_rate")
+        if retention_rate is not None:
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "commitment_type": "retention",
+                    "amount_value": None,
+                    "amount_currency": None,
+                    "percentage": retention_rate,
+                    "description": f"Retention: {retention_rate}% of contract value",
+                    "needs_review": False,
+                    "source_chunk_index": None,
+                }
+            )
+
+        advance_payment = summary.get("advance_payment")
+        if advance_payment:
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "commitment_type": "advance_payment",
+                    "amount_value": advance_payment.get("value"),
+                    "amount_currency": advance_payment.get("currency"),
+                    "percentage": None,
+                    "description": "Advance payment / mobilisation",
+                    "needs_review": bool(advance_payment.get("needs_review", False)),
+                    "source_chunk_index": None,
+                }
+            )
+
+        return rows
+    except Exception as e:
+        # Never raise — log run_id + error type, no values (REQ-006 NFR).
+        logger.exception(
+            "flatten_financial_summary_failed run_id=%s err_type=%s",
+            run_id,
+            type(e).__name__,
+        )
+        return []
 
 
 async def run_graph(
@@ -157,6 +294,26 @@ async def run_graph(
                         ])
                     )
 
+                # REQ-006: financial commitments.
+                # Do NOT persist if the degraded-path "error" key is present
+                # — the Analyst sees the error on the report page; no partial
+                # DB rows should be produced.
+                financial_summary = (
+                    final_checkpoint.values.get("financial_summary", {})
+                    if final_checkpoint is not None
+                    else {}
+                ) or {}
+                commitment_count = 0
+                if "error" not in financial_summary:
+                    commitment_rows = _flatten_financial_summary(
+                        financial_summary, run_id
+                    )
+                    if commitment_rows:
+                        await db.execute(
+                            insert(FinancialCommitment).values(commitment_rows)
+                        )
+                        commitment_count = len(commitment_rows)
+
                 await db.execute(
                     update(AnalysisRun)
                     .where(AnalysisRun.id == run_id)
@@ -167,15 +324,19 @@ async def run_graph(
                         ),
                     )
                 )
-                # Single commit — INSERT (if any) + UPDATE land atomically.
+                # Single commit — INSERTs (risk_findings, financial_commitments)
+                # + UPDATE land atomically across all four operations.
                 await db.commit()
 
-                # Log metadata only — NEVER clause_text or explanation
-                # (REQ-004 Security NFR, ai-security T5).
+                # Log metadata only — NEVER clause_text, explanation, amount_value
+                # or amount_currency (REQ-004 / REQ-006 Security NFR,
+                # ai-security T5).
                 logger.info(
-                    "analysis_run_awaiting_hitl run_id=%s finding_count=%d",
+                    "analysis_run_awaiting_hitl run_id=%s finding_count=%d "
+                    "commitment_count=%d",
                     run_id,
                     len(findings_dicts),
+                    commitment_count,
                 )
             else:
                 # The graph was interrupted before aggregation (e.g., supervisor
@@ -481,3 +642,61 @@ async def get_findings(
         .order_by(severity_order.asc(), RiskFinding.confidence.desc())
     )
     return [RiskFindingResponse.model_validate(f) for f in findings_result.scalars().all()]
+
+
+@router.get(
+    "/{tender_id}/financial",
+    response_model=list[FinancialCommitmentResponse],
+    summary="Get the financial commitments for a tender's latest analysis run.",
+)
+async def get_financial(
+    tender_id: Annotated[str, Path()],
+    company: CompanyDep,
+    session: SessionDep,
+) -> list[FinancialCommitmentResponse]:
+    """Return financial commitments for the latest analysis run, tenant-scoped.
+
+    Ordering: commitment_type ASC, id ASC — groups all rows of the same
+    type together in a stable order.
+    """
+    # a) + b) Latest analysis run for this tender.
+    result = await session.execute(
+        select(AnalysisRun)
+        .where(AnalysisRun.tender_id == tender_id)
+        .order_by(AnalysisRun.started_at.desc())
+        .limit(1)
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No analysis run found for this tender.",
+        )
+
+    # c) Authorisation — the run carries its own company_id for tenant scoping.
+    if run.company_id != company.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorised to view financial commitments for this tender.",
+        )
+
+    # d) State gate — commitments only exist after the awaiting_hitl transition.
+    if run.state not in ("awaiting_hitl", "complete"):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Financial summary not yet available.",
+        )
+
+    # e) Commitments for this run, ordered by type then id (stable within a type).
+    commitments_result = await session.execute(
+        select(FinancialCommitment)
+        .where(FinancialCommitment.run_id == run.id)
+        .order_by(
+            FinancialCommitment.commitment_type.asc(),
+            FinancialCommitment.id.asc(),
+        )
+    )
+    return [
+        FinancialCommitmentResponse.model_validate(c)
+        for c in commitments_result.scalars().all()
+    ]

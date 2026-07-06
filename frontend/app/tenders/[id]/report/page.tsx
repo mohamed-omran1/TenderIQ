@@ -1,14 +1,15 @@
 "use client";
 
 /**
- * /tenders/[id]/report — REQ-004 Slice 4 baseline, extended in REQ-005 Slice 4.
+ * /tenders/[id]/report — REQ-004 Slice 4 baseline, extended in REQ-005
+ * Slice 4, extended in REQ-006 Slice 4.
  *
  * Sections, top to bottom:
  *   1. Header (title + tender id).
  *   2. Amber info banner — preliminary review.
  *   3. <RiskRadarTable>  (REQ-004)
  *   4. <FeasibilityScoreCard>  (REQ-005)  — backed by useQuery(getAggregatedResults)
- *   5. Financial Summary placeholder  (REQ-006 still pending)
+ *   5. <FinancialSummaryCard>  (REQ-006)  — owns its own useQuery(getFinancialCommitments)
  *   6. Disabled "Approve & Generate Full Report" button  (REQ-007 still pending)
  *
  * TanStack Query v5 syntax is used verbatim: the spec mandates the
@@ -25,8 +26,8 @@ import { AlertCircle, Info } from "lucide-react";
 
 import RiskRadarTable from "@/components/RiskRadarTable";
 import FeasibilityScoreCard from "@/components/FeasibilityScoreCard";
+import FinancialSummaryCard from "@/components/FinancialSummaryCard";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   getAggregatedResults,
   ApiError,
@@ -103,7 +104,7 @@ function ReportPageBody() {
         breakdown={data?.feasibility_breakdown ?? null}
       />
 
-      <PlaceholderCard title="Financial Summary" />
+      <FinancialSummaryCard tenderId={tenderId} />
 
       <div className="flex flex-col items-stretch gap-2 pt-2 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-xs text-slate-500">
@@ -142,20 +143,5 @@ function QueryErrorBanner({ error }: { error: unknown }) {
       <AlertCircle className="mt-0.5 size-4 shrink-0" />
       <p>{message}</p>
     </div>
-  );
-}
-
-function PlaceholderCard({ title }: { title: string }) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{title}</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <div className="flex h-24 items-center justify-center rounded-md border border-dashed border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
-          Coming in full report
-        </div>
-      </CardContent>
-    </Card>
   );
 }

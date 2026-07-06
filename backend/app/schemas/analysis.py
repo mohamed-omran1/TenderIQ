@@ -54,3 +54,24 @@ class RiskFindingResponse(BaseModel):
     explanation: str
     source_chunk_index: int
     confidence: float
+
+
+class FinancialCommitmentResponse(BaseModel):
+    """Returned by GET /tenders/{id}/financial — one row per financial commitment.
+
+    Mirrors the `financial_commitments` ORM table (REQ-006 Slice 3). The
+    field set deliberately omits `run_id` (the URL identifies the tender;
+    the run is derived server-side from the latest analysis_run for that
+    tender).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    commitment_type: str
+    amount_value: float | None = None
+    amount_currency: str | None = None
+    percentage: float | None = None
+    description: str
+    needs_review: bool
+    source_chunk_index: int | None = None

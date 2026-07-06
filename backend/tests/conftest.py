@@ -853,3 +853,306 @@ def sample_scope_chunks() -> list[dict]:
         },
     ]
 
+
+# ---- REQ-006 Financial Analyst fixtures -------------------------------------
+
+
+class _MockFinancialLLM:
+    """Mock structured-output LLM that returns a canned FinancialOutput or raises.
+
+    Tracks call_count so tests can verify retry behaviour without inspecting
+    log output or timing. Mirrors the _MockStructuredLLM pattern used for
+    risk_radar (REQ-004) and _MockFeasibilityLLM (REQ-005).
+    """
+
+    def __init__(
+        self,
+        return_value: Any | None = None,
+        raise_exc: BaseException | None = None,
+    ) -> None:
+        self._return_value = return_value
+        self._raise_exc = raise_exc
+        self.call_count = 0
+
+    async def ainvoke(
+        self, messages: list, config: dict | None = None, **kwargs: Any
+    ) -> Any:
+        self.call_count += 1
+        if self._raise_exc:
+            raise self._raise_exc
+        return self._return_value
+
+
+@pytest_asyncio.fixture
+async def mock_financial_llm(monkeypatch: Any) -> _MockFinancialLLM:
+    """Fixture: patches financial_analyst._build_llm to return a valid FinancialOutput.
+    Contains all fields populated with the spec's canonical values.
+    """
+    from app.agents.skills.financial_extraction import (
+        BondRequirement,
+        FinancialOutput,
+        LiquidatedDamages,
+        MonetaryValue,
+        PaymentMilestone,
+    )
+
+    output = FinancialOutput(
+        contract_value=MonetaryValue(
+            value=35_000_000.0, currency="SAR", needs_review=False,
+        ),
+        bonds=[
+            BondRequirement(
+                bond_type="performance",
+                amount=MonetaryValue(
+                    value=3_500_000.0, currency="SAR", needs_review=False,
+                ),
+                percentage=10.0,
+                conditions=(
+                    "Unconditional bank guarantee valid until issuance "
+                    "of the Performance Certificate."
+                ),
+                source_chunk_index=0,
+            ),
+            BondRequirement(
+                bond_type="advance_payment",
+                amount=MonetaryValue(
+                    value=5_250_000.0, currency="SAR", needs_review=False,
+                ),
+                percentage=15.0,
+                conditions="Advance Payment Guarantee, 15% of contract value.",
+                source_chunk_index=1,
+            ),
+        ],
+        liquidated_damages=LiquidatedDamages(
+            rate=MonetaryValue(
+                value=5_000.0, currency="SAR", needs_review=False,
+            ),
+            period="per day",
+            cap=MonetaryValue(
+                value=3_500_000.0, currency="SAR", needs_review=False,
+            ),
+            cap_percentage=10.0,
+            source_chunk_index=2,
+        ),
+        payment_schedule=[
+            PaymentMilestone(
+                description="Advance mobilisation payment",
+                percentage=20.0,
+                amount=None,
+                trigger="on signing of Contract Agreement",
+            ),
+            PaymentMilestone(
+                description="Completion of works",
+                percentage=50.0,
+                amount=None,
+                trigger="on completion of all works",
+            ),
+            PaymentMilestone(
+                description="Final payment on taking-over certificate",
+                percentage=30.0,
+                amount=None,
+                trigger="on issuance of Taking-Over Certificate",
+            ),
+        ],
+        retention_rate=5.0,
+        advance_payment=MonetaryValue(
+            value=5_250_000.0, currency="SAR", needs_review=False,
+        ),
+    )
+    mock = _MockFinancialLLM(return_value=output)
+    monkeypatch.setattr(
+        "app.agents.nodes.financial_analyst._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_financial_llm_invalid_currency(
+    monkeypatch: Any,
+) -> _MockFinancialLLM:
+    """Fixture: returns a FinancialOutput with invalid currency codes.
+    contract_value.currency = "Riyals" (mapped via CURRENCY_NORMALISATION)
+    bonds[1].amount.currency = "INVALID_CURR" (-> UNKNOWN / needs_review=True)
+    """
+    from app.agents.skills.financial_extraction import (
+        BondRequirement,
+        FinancialOutput,
+        MonetaryValue,
+    )
+
+    output = FinancialOutput(
+        contract_value=MonetaryValue(
+            value=35_000_000.0, currency="Riyals", needs_review=False,
+        ),
+        bonds=[
+            BondRequirement(
+                bond_type="performance",
+                amount=MonetaryValue(
+                    value=3_500_000.0, currency="SAR", needs_review=False,
+                ),
+                percentage=10.0,
+                conditions="Performance bond.",
+                source_chunk_index=0,
+            ),
+            BondRequirement(
+                bond_type="advance_payment",
+                amount=MonetaryValue(
+                    value=5_250_000.0, currency="INVALID_CURR", needs_review=False,
+                ),
+                percentage=15.0,
+                conditions="Advance payment guarantee.",
+                source_chunk_index=1,
+            ),
+        ],
+        liquidated_damages=None,
+        payment_schedule=[],
+        retention_rate=None,
+        advance_payment=None,
+    )
+    mock = _MockFinancialLLM(return_value=output)
+    monkeypatch.setattr(
+        "app.agents.nodes.financial_analyst._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_financial_llm_malformed(
+    monkeypatch: Any,
+) -> _MockFinancialLLM:
+    """Fixture: patches financial_analyst._build_llm to fail schema validation."""
+    mock = _MockFinancialLLM(
+        raise_exc=OutputParserException(
+            "Failed to parse LLM output as FinancialOutput"
+        )
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.financial_analyst._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_financial_llm_api_error(
+    monkeypatch: Any,
+) -> _MockFinancialLLM:
+    """Fixture: patches financial_analyst._build_llm to raise API errors."""
+    mock = _MockFinancialLLM(
+        raise_exc=Exception("Simulated API connection error")
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.financial_analyst._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_financial_llm_bilingual_duplicate(
+    monkeypatch: Any,
+) -> _MockFinancialLLM:
+    """Fixture: returns a FinancialOutput with TWO performance bond entries.
+    Simulates pre-dedup state from Arabic + English chunks.
+    """
+    from app.agents.skills.financial_extraction import (
+        BondRequirement,
+        FinancialOutput,
+        MonetaryValue,
+    )
+
+    output = FinancialOutput(
+        contract_value=MonetaryValue(
+            value=35_000_000.0, currency="ريال سعودي", needs_review=False,
+        ),
+        bonds=[
+            BondRequirement(
+                bond_type="performance",
+                amount=MonetaryValue(
+                    value=3_500_000.0, currency="ريال سعودي", needs_review=False,
+                ),
+                percentage=10.0,
+                conditions="خطاب ضمان حسن التنفيذ بنسبة 10% من قيمة العقد",
+                source_chunk_index=0,
+            ),
+            BondRequirement(
+                bond_type="performance",
+                amount=MonetaryValue(
+                    value=3_500_000.0, currency="SAR", needs_review=False,
+                ),
+                percentage=10.0,
+                conditions="Performance bond of 10% of contract value.",
+                source_chunk_index=1,
+            ),
+        ],
+        liquidated_damages=None,
+        payment_schedule=[],
+        retention_rate=None,
+        advance_payment=None,
+    )
+    mock = _MockFinancialLLM(return_value=output)
+    monkeypatch.setattr(
+        "app.agents.nodes.financial_analyst._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest.fixture
+def sample_financial_chunks() -> list[dict]:
+    """6 chunk dicts covering bond requirements, payment terms, LD clauses,
+    and contract value (REQ-006 financial anchor topics).
+    """
+    return [
+        {
+            "content": (
+                "Section 4.2 - Performance Security. The Contractor shall provide "
+                "a Performance Security in the form of an unconditional bank "
+                "guarantee in the amount of 10% of the Accepted Contract Amount."
+            ),
+            "detected_language": "en",
+            "chunk_index": 0,
+        },
+        {
+            "content": (
+                "Section 14.2 - Advance Payment. The Employer shall make an "
+                "advance payment of 15% of the Accepted Contract Amount upon "
+                "submission of the Performance Security."
+            ),
+            "detected_language": "en",
+            "chunk_index": 1,
+        },
+        {
+            "content": (
+                "Section 8.7 - Delay Damages. The Contractor shall pay Delay "
+                "Damages at the rate of SAR 5,000 per day. The total amount "
+                "shall not exceed 10% of the Accepted Contract Amount."
+            ),
+            "detected_language": "en",
+            "chunk_index": 2,
+        },
+        {
+            "content": (
+                "Section 14.3 - Interim Payments. The Contractor shall submit "
+                "IPCs monthly. The Employer shall retain 5% of each IPC."
+            ),
+            "detected_language": "en",
+            "chunk_index": 3,
+        },
+        {
+            "content": (
+                "The Accepted Contract Amount is SAR 35,000,000. Payment shall "
+                "be made as follows: 20%% on signing, 50%% on completion, "
+                "30%% on taking-over certificate."
+            ),
+            "detected_language": "en",
+            "chunk_index": 4,
+        },
+        {
+            "content": (
+                "Section 14.2 - Advance Payment. The advance payment of "
+                "SAR 5,250,000 shall be repaid by deductions from each IPC "
+                "at a rate of 25%% of the amount of each IPC."
+            ),
+            "detected_language": "en",
+            "chunk_index": 5,
+        },
+    ]
+
