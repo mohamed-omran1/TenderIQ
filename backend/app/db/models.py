@@ -251,9 +251,11 @@ class TenderChunk(Base):
 class AnalysisRun(Base):
     """One execution of the LangGraph analysis pipeline for a tender.
 
-    State transitions: pending -> running -> awaiting_hitl -> complete
-    (or failed). `agent_trace` is an append-only audit log of every node that
-    ran; updates are atomic JSONB concatenations, never read-modify-write.
+    State transitions: pending -> running -> awaiting_hitl -> resuming ->
+    complete (or failed at any point). `agent_trace` is an append-only audit
+    log of every node that ran; updates are atomic JSONB concatenations, never
+    read-modify-write. `resuming` is an intermediate state set during HITL
+    resume to prevent double-approval race conditions (REQ-007).
     """
 
     __tablename__ = "analysis_runs"
@@ -311,11 +313,20 @@ class AnalysisRun(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "state IN ('pending', 'running', 'awaiting_hitl', 'complete', 'failed')",
+            "state IN ("
+            "'pending', 'running', 'awaiting_hitl', 'resuming', "
+            "'complete', 'failed')",
             name="analysis_runs_state_check",
         ),
         # Status polling always looks up the latest run for a tender.
         Index("ix_analysis_runs_tender_started", "tender_id", "started_at"),
+    )
+
+    hitl_override: Mapped[HITLOverride | None] = relationship(
+        "HITLOverride",
+        back_populates="run",
+        uselist=False,
+        viewonly=True,
     )
 
 
@@ -456,6 +467,54 @@ class FinancialCommitment(Base):
         Index("ix_financial_commitments_run_type", "run_id", "commitment_type"),
         # Fast query for items flagged for analyst review.
         Index("ix_financial_commitments_run_review", "run_id", "needs_review"),
+    )
+
+
+class HITLOverride(Base):
+    """Immutable audit log of a human-in-the-loop decision (REQ-007).
+
+    One row per analysis run — a UNIQUE constraint on run_id enforces
+    "one override per run". Rows are write-once and NEVER updated or
+    deleted (REQ-007 audit integrity NFR).
+
+    `justification` holds commercially sensitive reasoning and must never
+    appear in logs (REQ-007 Security NFR).
+    """
+
+    __tablename__ = "hitl_overrides"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, server_default=text("gen_random_uuid()::text")
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("analysis_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    analyst_company_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    original_score: Mapped[float] = mapped_column(Float, nullable=False)
+    overridden_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    justification: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    run: Mapped[AnalysisRun] = relationship(
+        "AnalysisRun", back_populates="hitl_override"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('approved', 'overridden')",
+            name="hitl_overrides_action_check",
+        ),
+        Index("ix_hitl_overrides_run_id", "run_id"),
     )
 
 

@@ -1095,6 +1095,216 @@ async def mock_financial_llm_bilingual_duplicate(
     return mock
 
 
+# ---- REQ-007 HITL Override Gate fixtures -------------------------------
+
+
+@pytest_asyncio.fixture
+async def awaiting_hitl_run(
+    app_client,
+    db,
+    company_with_profile,
+    auth_headers,
+    mock_llm,
+    mock_feasibility_llm,
+    mock_financial_llm,
+    profile_lookup_session,
+    monkeypatch,
+) -> dict:
+    """Create a tender, run full analysis, and return when state='awaiting_hitl'.
+
+    The returned dict provides tender_id, run_id, company, and raw_key so each
+    test can POST /approve or /override without repeating the setup.
+
+    Depends on mock_llm fixtures so the graph runs without real API calls
+    (REQ-007 QA: never hit real LLM providers in CI).
+
+    The graph is run via its checkpointer directly (not through
+    ``run_graph``) so the test session is never contested.  The DB state
+    is updated manually after the graph reaches the HITL interrupt.
+    """
+    import asyncio
+    from uuid import uuid4
+
+    from app.db.models import AnalysisRun, Tender, TenderChunk
+    from sqlalchemy import func, update
+
+    company, raw_key = company_with_profile
+    EMBEDDING_STUB = [0.01] * get_settings().embedding_dimensions
+
+    # ── Mock embeddings ─────────────────────────────────────────────────────
+    # Every module that calls get_embeddings_client must be patched separately
+    # because Python's ``from ... import`` creates a local name binding that is
+    # invisible to a module-level monkeypatch of the source module.
+    class _MockEmbeddings:
+        def embed_documents(self, texts):
+            return [[0.01] * get_settings().embedding_dimensions for _ in texts]
+        def embed_query(self, text):
+            return [0.01] * get_settings().embedding_dimensions
+    monkeypatch.setattr("app.agents.retrieval.get_embeddings_client", lambda: _MockEmbeddings())
+    monkeypatch.setattr("app.agents.nodes.risk_radar.get_embeddings_client", lambda: _MockEmbeddings())
+
+    tender = Tender(
+        id=str(uuid4()),
+        company_id=company.id,
+        filename="hitl_test.pdf",
+        storage_path="/tmp/hitl_test.pdf",
+        file_size_bytes=100,
+        status="ready",
+    )
+    db.add(tender)
+    await db.flush()
+
+    for i in range(3):
+        chunk = TenderChunk(
+            id=str(uuid4()),
+            tender_id=tender.id,
+            company_id=company.id,
+            chunk_index=i,
+            content=f"HITL test chunk {i} content for analysis testing.",
+            detected_language="en",
+            embedding=EMBEDDING_STUB,
+        )
+        db.add(chunk)
+    await db.flush()
+
+    run = AnalysisRun(
+        id=str(uuid4()),
+        tender_id=tender.id,
+        company_id=company.id,
+        state="pending",
+    )
+    db.add(run)
+    await db.flush()
+    run_id = run.id
+    await db.commit()
+
+    chunks = [
+        {
+            "content": f"HITL test chunk {i} content for analysis testing.",
+            "detected_language": "en",
+            "chunk_index": i,
+        }
+        for i in range(3)
+    ]
+
+    from app.agents.graph import graph
+    from app.agents.state import TenderState
+
+    initial_state = TenderState(
+        tender_id=str(tender.id),
+        run_id=str(run_id),
+        company_id=str(company.id),
+        chunks=chunks,
+        supervisor_ready=False,
+        risk_findings=[],
+        feasibility_score=None,
+        feasibility_breakdown=None,
+        financial_summary=None,
+        aggregated_results=None,
+        hitl_approved=False,
+        hitl_override_score=None,
+        final_report=None,
+        token_usage=[],
+        source_languages=[],
+    )
+    config = {"configurable": {"thread_id": str(run_id)}}
+
+    saw_aggregator = False
+    async for event in graph.astream(initial_state, config):
+        node_name = list(event.keys())[0]
+        if node_name.startswith("__"):
+            continue
+        if node_name == "aggregator":
+            saw_aggregator = True
+
+    if saw_aggregator:
+        final_checkpoint = await graph.aget_state(config)
+        feasibility_score = final_checkpoint.values.get("feasibility_score") if final_checkpoint else None
+        findings = (final_checkpoint.values.get("risk_findings", []) or []) if final_checkpoint else []
+        financial_summary = (final_checkpoint.values.get("financial_summary", {}) or {}) if final_checkpoint else {}
+
+        if findings:
+            from sqlalchemy import insert
+            from app.db.models import RiskFinding
+            await db.execute(
+                insert(RiskFinding).values([
+                    {
+                        "run_id": run_id,
+                        "category": f["category"],
+                        "severity": f["severity"],
+                        "clause_text": f["clause_text"],
+                        "explanation": f["explanation"],
+                        "source_chunk_index": f["source_chunk_index"],
+                        "confidence": f["confidence"],
+                    }
+                    for f in findings
+                ])
+            )
+
+        if "error" not in financial_summary:
+            from app.routers.tenders import _flatten_financial_summary
+            commitment_rows = _flatten_financial_summary(financial_summary, run_id)
+            if commitment_rows:
+                from sqlalchemy import insert
+                from app.db.models import FinancialCommitment
+                await db.execute(
+                    insert(FinancialCommitment).values(commitment_rows)
+                )
+
+        await db.execute(
+            update(AnalysisRun)
+            .where(AnalysisRun.id == run_id)
+            .values(
+                state="awaiting_hitl",
+                feasibility_score=feasibility_score,
+                started_at=func.now(),
+            )
+        )
+        await db.commit()
+    else:
+        pytest.fail("Graph did not reach the aggregator — HITL gate not hit")
+
+    return {
+        "tender_id": tender.id,
+        "run_id": run_id,
+        "company": company,
+        "raw_key": raw_key,
+    }
+
+
+@pytest_asyncio.fixture
+async def mock_report_assembler(monkeypatch) -> None:
+    """Patch report_assembler_node to return immediately with a mock report.
+
+    Prevents real LLM calls during HITL tests even after REQ-008 wires in
+    the real Report Assembler (REQ-007 QA: never make real LLM calls in tests).
+
+    Patching the module-level function is sufficient because the compiled graph
+    was constructed with ``add_node("report_assembler", report_assembler_node)``
+    which stores a reference from the module-level name.  After REQ-008
+    replaces the stub, this fixture will need to also update the compiled
+    graph's internal node reference.
+    """
+    async def _mock(state, config):
+        state["final_report"] = "MOCK REPORT"
+        return state
+
+    monkeypatch.setattr(
+        "app.agents.nodes.report_assembler.report_assembler_node",
+        _mock,
+    )
+
+
+@pytest_asyncio.fixture
+async def second_company(company_b: tuple) -> str:
+    """Raw API key for a second tenant (cross-tenant authorisation tests).
+
+    Alias for ``second_company_api_key`` to match the naming in the REQ-007
+    QA slice spec.
+    """
+    return company_b[1]
+
+
 @pytest.fixture
 def sample_financial_chunks() -> list[dict]:
     """6 chunk dicts covering bond requirements, payment terms, LD clauses,

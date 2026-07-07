@@ -6,8 +6,9 @@ Implements REQ-001 Main Flow steps 1–5 and 10:
 
 Also implements REQ-003 (analyse + status), REQ-004 Slice 3 (findings
 persistence + GET /tenders/{id}/findings), REQ-005 Slice 3 (feasibility
-score persistence in the same atomic commit block), and REQ-006 Slice 3
-(financial commitments persistence + GET /tenders/{id}/financial).
+score persistence in the same atomic commit block), REQ-006 Slice 3
+(financial commitments persistence + GET /tenders/{id}/financial), and
+REQ-007 Slice 1 (POST /approve + POST /override + _resume_graph).
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from app.db.models import (
     AnalysisRun,
     Company,
     FinancialCommitment,
+    HITLOverride,
     RiskFinding,
     Tender,
     TenderChunk,
@@ -46,7 +48,11 @@ from app.middleware.auth import get_current_company
 from app.middleware.rate_limit import check_rate_limit
 from app.schemas.analysis import (
     AnalyseResponse,
+    ApproveRequest,
     FinancialCommitmentResponse,
+    HITLOverrideResponse,
+    HITLResponse,
+    OverrideRequest,
     RiskFindingResponse,
     RunStatusResponse,
 )
@@ -361,6 +367,66 @@ async def run_graph(
                 await db.commit()
             except Exception:
                 logger.exception("analysis_run_failed_to_persist_error run_id=%s", run_id)
+
+
+async def _resume_graph(
+    run_id: str,
+    override_score: float | None,
+) -> None:
+    """Background worker: resumes the LangGraph pipeline from the HITL gate.
+
+    Uses its own AsyncSession — not the request session — consistent with
+    the run_graph() pattern (REQ-003 Slice 2 Rules).
+
+    Injects hitl_approved=True (and optionally hitl_override_score) into the
+    checkpoint state, then resumes graph.astream(None, config) from the
+    existing checkpoint. The report_assembler node runs and the run
+    transitions to "complete" (or "failed" on error).
+
+    The hitl_overrides row is NEVER deleted on failure — the audit log is
+    preserved even if the resume fails (REQ-007 Reliability NFR).
+    """
+    from app.agents.graph import graph
+
+    async with with_session() as db:
+        try:
+            config = {"configurable": {"thread_id": str(run_id)}}
+
+            update_values: dict = {"hitl_approved": True}
+            if override_score is not None:
+                update_values["hitl_override_score"] = override_score
+
+            await graph.aupdate_state(config, update_values)
+
+            async for event in graph.astream(None, config):
+                node_name = list(event.keys())[0]
+                if node_name.startswith("__"):
+                    continue
+                await db.execute(
+                    update(AnalysisRun)
+                    .where(AnalysisRun.id == run_id)
+                    .values(
+                        agent_trace=AnalysisRun.agent_trace.concat(
+                            {node_name: event[node_name]}
+                        )
+                    )
+                )
+                await db.commit()
+
+            await db.execute(
+                update(AnalysisRun)
+                .where(AnalysisRun.id == run_id)
+                .values(state="complete", completed_at=func.now())
+            )
+            await db.commit()
+
+        except Exception as e:
+            await db.execute(
+                update(AnalysisRun)
+                .where(AnalysisRun.id == run_id)
+                .values(state="failed", error_reason=f"Resume failed: {str(e)}")
+            )
+            await db.commit()
 
 
 @router.post(
@@ -700,3 +766,245 @@ async def get_financial(
         FinancialCommitmentResponse.model_validate(c)
         for c in commitments_result.scalars().all()
     ]
+
+
+@router.get(
+    "/{tender_id}/hitl-override",
+    response_model=HITLOverrideResponse,
+    summary="Get the HITL override decision for the latest analysis run.",
+)
+async def get_hitl_override(
+    tender_id: Annotated[str, Path()],
+    company: CompanyDep,
+    session: SessionDep,
+) -> HITLOverrideResponse:
+    """Return the HITL override decision for the latest analysis run, tenant-scoped.
+
+    404 if no override exists yet — the run may not have reached the HITL
+    gate or the analyst has not yet acted. justification is NEVER included
+    in the response (REQ-007 Security NFR).
+    """
+    # a) + b) Latest analysis run for this tender.
+    result = await session.execute(
+        select(AnalysisRun)
+        .where(AnalysisRun.tender_id == tender_id)
+        .order_by(AnalysisRun.started_at.desc())
+        .limit(1)
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No analysis run found for this tender.",
+        )
+
+    # c) Authorisation — the run belongs to the caller's company.
+    if run.company_id != company.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorised to view this HITL override.",
+        )
+
+    # d) Query hitl_overrides for this run.
+    override_result = await session.execute(
+        select(HITLOverride).where(HITLOverride.run_id == run.id)
+    )
+    override = override_result.scalar_one_or_none()
+    if override is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No HITL override has been recorded for this run.",
+        )
+
+    return HITLOverrideResponse.model_validate(override)
+
+
+@router.post(
+    "/{tender_id}/approve",
+    response_model=HITLResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Approve the AI feasibility score as-is and resume the analysis.",
+)
+async def approve_analysis(
+    background_tasks: BackgroundTasks,
+    tender_id: Annotated[str, Path()],
+    request: ApproveRequest,
+    company: CompanyDep,
+    session: SessionDep,
+) -> HITLResponse:
+    """Approve the AI score without modification. Graph resumes from checkpoint.
+
+    HTTP 202 returned immediately; the Report Assembler runs as a background
+    task. The hitl_overrides row is an immutable audit record (REQ-007).
+    """
+    # b) Fetch latest analysis_run for this tender_id.
+    run_result = await session.execute(
+        select(AnalysisRun)
+        .where(AnalysisRun.tender_id == tender_id)
+        .order_by(AnalysisRun.started_at.desc())
+        .limit(1)
+    )
+    run = run_result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No analysis run found for this tender.",
+        )
+
+    # c) Authorisation — the run belongs to the caller's company.
+    if run.company_id != company.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorised to act on this tender.",
+        )
+
+    # d) State check — must be awaiting_hitl.
+    if run.state != "awaiting_hitl":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Run is not awaiting review. Current state: {run.state}.",
+        )
+
+    # e) Check no existing hitl_overrides row for this run_id.
+    existing = await session.execute(
+        select(HITLOverride.id).where(HITLOverride.run_id == run.id)
+    )
+    if existing.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This run has already been reviewed.",
+        )
+
+    if run.feasibility_score is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Feasibility score is not available for this run.",
+        )
+
+    original_score = run.feasibility_score
+
+    # f) Write hitl_overrides row — action="approved".
+    override = HITLOverride(
+        run_id=run.id,
+        analyst_company_id=company.id,
+        action="approved",
+        original_score=original_score,
+        overridden_score=None,
+        justification=request.justification,
+    )
+    session.add(override)
+
+    # g) Update analysis_runs.state = "resuming" (prevents double-approval).
+    run.state = "resuming"
+
+    # h) Commit BEFORE launching background task.
+    await session.commit()
+
+    # i) Launch background task with its own session.
+    background_tasks.add_task(_resume_graph, run.id, None)
+
+    # j) Return HTTP 202 immediately.
+    return HITLResponse(
+        run_id=run.id,
+        action="approved",
+        original_score=original_score,
+        overridden_score=None,
+        message="Report assembly started.",
+    )
+
+
+@router.post(
+    "/{tender_id}/override",
+    response_model=HITLResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Override the AI feasibility score and resume the analysis.",
+)
+async def override_analysis(
+    background_tasks: BackgroundTasks,
+    tender_id: Annotated[str, Path()],
+    request: OverrideRequest,
+    company: CompanyDep,
+    session: SessionDep,
+) -> HITLResponse:
+    """Override the AI score with an analyst-adjusted value. Graph resumes.
+
+    HTTP 202 returned immediately; the Report Assembler runs with the
+    analyst's overridden_score instead of the AI feasibility_score.
+    The hitl_overrides row is an immutable audit record (REQ-007).
+    """
+    # b) Fetch latest analysis_run for this tender_id.
+    run_result = await session.execute(
+        select(AnalysisRun)
+        .where(AnalysisRun.tender_id == tender_id)
+        .order_by(AnalysisRun.started_at.desc())
+        .limit(1)
+    )
+    run = run_result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No analysis run found for this tender.",
+        )
+
+    # c) Authorisation — the run belongs to the caller's company.
+    if run.company_id != company.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorised to act on this tender.",
+        )
+
+    # d) State check — must be awaiting_hitl.
+    if run.state != "awaiting_hitl":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Run is not awaiting review. Current state: {run.state}.",
+        )
+
+    # e) Check no existing hitl_overrides row for this run_id.
+    existing = await session.execute(
+        select(HITLOverride.id).where(HITLOverride.run_id == run.id)
+    )
+    if existing.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This run has already been reviewed.",
+        )
+
+    if run.feasibility_score is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Feasibility score is not available for this run.",
+        )
+
+    original_score = run.feasibility_score
+
+    # g) Write hitl_overrides row — action="overridden".
+    override = HITLOverride(
+        run_id=run.id,
+        analyst_company_id=company.id,
+        action="overridden",
+        original_score=original_score,
+        overridden_score=request.overridden_score,
+        justification=request.justification,
+    )
+    session.add(override)
+
+    # h) Update analysis_runs.state = "resuming" (prevents double-approval).
+    run.state = "resuming"
+
+    # i) Commit BEFORE launching background task.
+    await session.commit()
+
+    # j) Launch background task with its own session.
+    background_tasks.add_task(
+        _resume_graph, run.id, request.overridden_score
+    )
+
+    # k) Return HTTP 202 immediately.
+    return HITLResponse(
+        run_id=run.id,
+        action="overridden",
+        original_score=original_score,
+        overridden_score=request.overridden_score,
+        message="Report assembly started.",
+    )

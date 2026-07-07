@@ -27,9 +27,10 @@ import { AlertCircle, Info } from "lucide-react";
 import RiskRadarTable from "@/components/RiskRadarTable";
 import FeasibilityScoreCard from "@/components/FeasibilityScoreCard";
 import FinancialSummaryCard from "@/components/FinancialSummaryCard";
-import { Button } from "@/components/ui/button";
+import HITLGate from "@/components/HITLGate";
 import {
   getAggregatedResults,
+  getRunStatus,
   ApiError,
   AuthError,
 } from "@/lib/api/analysis";
@@ -62,9 +63,16 @@ function ReportPageBody() {
     data,
     isError,
     error,
+    refetch,
   } = useQuery({
     queryKey: ["aggregated-results", tenderId],
     queryFn: () => getAggregatedResults(tenderId),
+    enabled: !!tenderId,
+  });
+
+  const { data: runStatus } = useQuery({
+    queryKey: ["run-status", tenderId],
+    queryFn: () => getRunStatus(tenderId),
     enabled: !!tenderId,
   });
 
@@ -106,19 +114,12 @@ function ReportPageBody() {
 
       <FinancialSummaryCard tenderId={tenderId} />
 
-      <div className="flex flex-col items-stretch gap-2 pt-2 sm:flex-row sm:items-center sm:justify-between">
-        <p className="text-xs text-slate-500">
-          HITL approval — coming in REQ-007
-        </p>
-        <Button
-          disabled
-          aria-disabled
-          title="HITL approval — coming in REQ-007"
-          className="sm:ml-auto"
-        >
-          Approve &amp; Generate Full Report
-        </Button>
-      </div>
+      <HITLGate
+        tenderId={tenderId}
+        currentScore={data?.feasibility_score ?? 0}
+        runState={runStatus?.state ?? "awaiting_hitl"}
+        onApproved={() => refetch()}
+      />
     </main>
   );
 }

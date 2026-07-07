@@ -1,4 +1,4 @@
-"""Pydantic v2 request/response models for the analysis-run endpoints (REQ-003)."""
+"""Pydantic v2 request/response models for the analysis-run endpoints (REQ-003, REQ-007)."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -75,3 +75,59 @@ class FinancialCommitmentResponse(BaseModel):
     description: str
     needs_review: bool
     source_chunk_index: int | None = None
+
+
+# ── REQ-007 HITL Override Gate schemas ────────────────────────────
+
+
+class ApproveRequest(BaseModel):
+    """Request body for POST /tenders/{id}/approve — approve AI score as-is.
+
+    justification is optional for approvals but encouraged for the audit log.
+    """
+
+    justification: str | None = None
+
+
+class OverrideRequest(BaseModel):
+    """Request body for POST /tenders/{id}/override — adjust the feasibility score.
+
+    overridden_score must be between 0.0 and 100.0 (inclusive).
+    justification is required — a minimum of 10 characters (REQ-007).
+    """
+
+    overridden_score: float = Field(
+        ge=0.0, le=100.0,
+        description="Analyst-adjusted feasibility score (0-100)",
+    )
+    justification: str = Field(
+        min_length=10,
+        description="Required when overriding the AI score",
+    )
+
+
+class HITLResponse(BaseModel):
+    """Returned by POST /tenders/{id}/approve and /override — HTTP 202."""
+
+    run_id: UUID
+    action: str
+    original_score: float
+    overridden_score: float | None = None
+    message: str
+
+
+class HITLOverrideResponse(BaseModel):
+    """Returned by GET /tenders/{id}/hitl-override — the HITL decision for a run.
+
+    justification is NEVER included — it is an internal audit field only
+    (REQ-007 Security NFR). The field is stored in the DB for audit trails
+    but must never be surfaced to the UI or API responses.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    run_id: UUID
+    action: str
+    original_score: float
+    overridden_score: float | None = None
+    created_at: datetime
