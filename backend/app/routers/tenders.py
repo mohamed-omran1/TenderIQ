@@ -53,7 +53,9 @@ from app.schemas.analysis import (
     HITLOverrideResponse,
     HITLResponse,
     OverrideRequest,
+    ReportResponse,
     RiskFindingResponse,
+    RiskSummaryItemResponse,
     RunStatusResponse,
 )
 from app.schemas.tender import TenderDetailResponse, TenderUploadResponse
@@ -648,6 +650,15 @@ async def get_analysis_status(
         error_reason=run.error_reason,
         feasibility_score=run.feasibility_score,
         agent_trace=run.agent_trace or {},
+        # REQ-008 Slice 3: True only when the run is complete AND the
+        # report_assembler node has populated agent_trace. The frontend uses
+        # this to navigate to the report page without an extra GET /report
+        # call. `agent_trace` may be an empty dict on a failed run — that
+        # must not be reported as "report_available".
+        report_available=(
+            run.state == "complete"
+            and bool((run.agent_trace or {}).get("report_assembler"))
+        ),
     )
 
 
@@ -817,6 +828,138 @@ async def get_hitl_override(
         )
 
     return HITLOverrideResponse.model_validate(override)
+
+
+@router.get(
+    "/{tender_id}/report",
+    response_model=ReportResponse,
+    summary="Get the Report Assembler's Go/No-Go brief for a tender's latest run.",
+)
+async def get_report(
+    tender_id: Annotated[str, Path()],
+    company: CompanyDep,
+    session: SessionDep,
+) -> ReportResponse:
+    """Return the Go/No-Go brief produced by the report_assembler node.
+
+    The report is read from
+    ``analysis_runs.agent_trace["report_assembler"]["final_report"]``
+    which the node writes after HITL approval (REQ-008 Slice 2). The
+    endpoint is HTTP 200 only when ``run.state == "complete"``; before
+    that the router returns 404 — the report page polls this endpoint
+    and 404 is the expected "not ready" signal, consistent with
+    GET /tenders/{id}/financial in REQ-006.
+
+    Security:
+    - Tenant-scoped: returns 403 if the run belongs to another company.
+    - Never logs raw risk-clause text or financial commitment values
+      (REQ-006 / REQ-008 Security NFR). Only metadata (run_id, state,
+      report_data presence) is logged.
+    - The report_assembler may produce a fallback report on LLM failure;
+      this endpoint surfaces that fallback as-is.
+    """
+    # a) + b) Fetch latest analysis_run for this tender.
+    result = await session.execute(
+        select(AnalysisRun)
+        .where(AnalysisRun.tender_id == tender_id)
+        .order_by(AnalysisRun.started_at.desc())
+        .limit(1)
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No analysis run found for this tender.",
+        )
+
+    # c) Authorisation — the run carries its own company_id for tenant
+    # scoping. 403 (not 404) here is intentional: the run exists, the
+    # caller just belongs to a different tenant.
+    if run.company_id != company.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorised to view report for this tender.",
+        )
+
+    # d) State gate — report only exists after the run is "complete".
+    # 404 (not 409) is the polling signal (see slice spec). The frontend
+    # expects 404 here for "not ready" and treats it as a normal
+    # poll-result, not an error.
+    if run.state != "complete":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Report not yet available. Current state: {run.state}."
+            ),
+        )
+
+    # e) Extract report data with defensive .get() at every level.
+    # agent_trace may be an empty dict on a failed run, and the
+    # "report_assembler" key may be missing or its value may not be a
+    # dict (legacy or partial writes). Never assume structure.
+    report_data = (
+        (run.agent_trace or {})
+        .get("report_assembler", {})
+        .get("final_report", {})
+    ) or {}
+
+    # f) If the trace exists but has no final_report, the run is
+    # malformed (shouldn't happen in practice — `_resume_graph` sets
+    # state="complete" after the report_assembler node finishes). Treat
+    # it the same as "not ready" from the caller's perspective.
+    if not report_data:
+        logger.warning(
+            "get_report_missing_final_report run_id=%s state=%s",
+            run.id,
+            run.state,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report data not found in run trace.",
+        )
+
+    # g) Build and return the typed ReportResponse. Every field uses
+    # .get() with safe defaults so a partial trace (e.g. fallback report
+    # written by the assembler after an LLM failure) still serialises.
+    # We log metadata only — never the actual report body, which may
+    # contain risk-clause paraphrases and financial commitment values.
+    logger.info(
+        "get_report_served run_id=%s go_no_go=%s override=%s "
+        "risk_count=%d highlight_counts=fea:%d/fin:%d",
+        run.id,
+        report_data.get("go_no_go", "REVIEW"),
+        report_data.get("is_analyst_override", False),
+        len(report_data.get("risk_summary", []) or []),
+        len(report_data.get("feasibility_highlights", []) or []),
+        len(report_data.get("financial_highlights", []) or []),
+    )
+
+    return ReportResponse(
+        run_id=run.id,
+        tender_id=tender_id,
+        go_no_go=report_data.get("go_no_go", "REVIEW"),
+        effective_score=float(
+            report_data.get("effective_score", 0.0)
+        ),
+        is_analyst_override=bool(
+            report_data.get("is_analyst_override", False)
+        ),
+        executive_summary=report_data.get("executive_summary", "") or "",
+        recommendation=report_data.get("recommendation", "") or "",
+        risk_summary=[
+            RiskSummaryItemResponse(**r)
+            for r in (report_data.get("risk_summary", []) or [])
+            if isinstance(r, dict)
+        ],
+        feasibility_highlights=list(
+            report_data.get("feasibility_highlights", []) or []
+        ),
+        financial_highlights=list(
+            report_data.get("financial_highlights", []) or []
+        ),
+        analyst_note=report_data.get("analyst_note"),
+        completed_at=run.completed_at,
+    )
 
 
 @router.post(

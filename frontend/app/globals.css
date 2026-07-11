@@ -165,3 +165,37 @@ body {
     @apply font-sans;
   }
 }
+
+/*
+ * Print stylesheet — REQ-008 Slice 4 "Download as PDF" button.
+ *
+ * The full report page triggers window.print() from FullReportView; the
+ * browser's native print-to-PDF dialog handles the file output. The rules
+ * below ensure the printed copy is clean: nav/header chrome is hidden,
+ * page background and card borders are flattened, and links are rendered
+ * in their natural colour.
+ */
+@media print {
+  body {
+    background: #ffffff;
+  }
+  header.print\:hidden,
+  .print\:hidden {
+    display: none !important;
+  }
+  main {
+    max-width: 100% !important;
+    padding: 0 !important;
+  }
+  [data-slot="card"] {
+    box-shadow: none !important;
+    border-color: #e2e8f0 !important;
+    page-break-inside: avoid;
+  }
+  section[role="status"] {
+    page-break-after: avoid;
+  }
+  table {
+    page-break-inside: avoid;
+  }
+}

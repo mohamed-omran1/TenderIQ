@@ -23,6 +23,11 @@ class RunStatusResponse(BaseModel):
     public API contract exposes it as `run_id` (REQ-003 spec). We populate
     `run_id` explicitly in the router to keep the mapping visible and avoid
     a field-level alias that would also apply to the other column reads.
+
+    `report_available` is True only when the run is complete AND the
+    report_assembler node has populated ``agent_trace`` (REQ-008 Slice 3).
+    The frontend uses this flag to navigate to the report page without
+    having to call GET /report just to check availability.
     """
 
     run_id: UUID
@@ -32,6 +37,7 @@ class RunStatusResponse(BaseModel):
     error_reason: str | None = None
     feasibility_score: float | None = None
     agent_trace: dict = Field(default_factory=dict)
+    report_available: bool = False
 
 
 class RiskFindingResponse(BaseModel):
@@ -131,3 +137,52 @@ class HITLOverrideResponse(BaseModel):
     original_score: float
     overridden_score: float | None = None
     created_at: datetime
+
+
+# ── REQ-008 Report Assembler (Slice 3) response schemas ─────────────
+
+
+class RiskSummaryItemResponse(BaseModel):
+    """One item in the report's top-5 risk summary (REQ-008 Slice 3).
+
+    Mirrors the ``RiskSummaryItem`` Pydantic schema in
+    `app/agents/skills/report_synthesis.py` (the LLM structured output
+    contract) and the items stored under
+    ``agent_trace["report_assembler"]["final_report"]["risk_summary"]``.
+    """
+
+    category: str
+    severity: str
+    description: str
+
+
+class ReportResponse(BaseModel):
+    """Returned by GET /tenders/{id}/report — the full Go/No-Go brief.
+
+    The wire contract for the report_assembler output. Field set matches
+    the ``ReportOutput`` schema in
+    `app/agents/skills/report_synthesis.py` plus the run's
+    ``completed_at`` timestamp so the frontend can show "Generated at …".
+
+    `analyst_note` is the override-acknowledgement string set by the
+    Report Assembler when the analyst adjusted the AI score (REQ-007
+    override flow). May be None when no override happened.
+
+    The endpoint is HTTP 200 only when ``run.state == "complete"``; before
+    that the router returns 404 (the report page polls this endpoint, so
+    404 is the expected "not ready" signal — consistent with
+    GET /tenders/{id}/financial in REQ-006).
+    """
+
+    run_id: UUID
+    tender_id: UUID
+    go_no_go: str
+    effective_score: float
+    is_analyst_override: bool
+    executive_summary: str
+    recommendation: str
+    risk_summary: list[RiskSummaryItemResponse]
+    feasibility_highlights: list[str]
+    financial_highlights: list[str]
+    analyst_note: str | None = None
+    completed_at: datetime | None = None

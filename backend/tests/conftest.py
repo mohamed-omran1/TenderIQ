@@ -1095,6 +1095,274 @@ async def mock_financial_llm_bilingual_duplicate(
     return mock
 
 
+# ---- REQ-008 Report Assembler fixtures -------------------------------------
+
+
+def _build_faithful_output(messages: list) -> Any:
+    """Build a ``ReportOutput`` that matches the context instructions.
+
+    Parses ``effective_score``, ``go_no_go``, and ``is_analyst_override``
+    from the final ``HumanMessage`` rendered by ``_format_report_context``
+    so the mock is "faithful" to what the node tells the LLM.
+    """
+    import re
+
+    from app.agents.skills.report_synthesis import GoNoGo, ReportOutput
+
+    effective_score = 82.0
+    go_no_go = "GO"
+    is_analyst_override = False
+    ai_score = None
+
+    for msg in messages:
+        if not hasattr(msg, "content") or not isinstance(msg.content, str):
+            continue
+        content: str = msg.content
+
+        m = re.search(
+            r"## Effective Feasibility Score\n\s*([\d.]+)", content
+        )
+        if m:
+            effective_score = float(m.group(1))
+
+        m = re.search(
+            r"## Go/No-Go Recommendation[^#]*\n\s*(GO|REVIEW|DECLINE)",
+            content,
+        )
+        if m:
+            go_no_go = m.group(1)
+
+        m = re.search(r"## Is Analyst Override\n\s*(True|False)", content)
+        if m:
+            is_analyst_override = m.group(1) == "True"
+
+        m = re.search(r"ai_score\):\s*([\d.]+)", content)
+        if m:
+            ai_score = float(m.group(1))
+
+    # Determine risk count from the "Top N Risks" header
+    risk_count = 0
+    for msg in messages:
+        if not hasattr(msg, "content") or not isinstance(msg.content, str):
+            continue
+        m = re.search(r"## Top (\d+) Risks", msg.content)
+        if m:
+            risk_count = int(m.group(1))
+            break
+
+    if risk_count < 1:
+        risk_count = 2
+
+    return _make_report_output(
+        go_no_go=go_no_go,
+        effective_score=effective_score,
+        is_analyst_override=is_analyst_override,
+        analyst_note=(
+            "Feasibility score adjusted by analyst review."
+            if is_analyst_override
+            else None
+        ),
+        risk_count=risk_count,
+    )
+
+
+class _MockReportLLM:
+    """Mock structured-output LLM for report_assembler (REQ-008).
+
+    When ``return_value`` is provided returns it verbatim (canned
+    responses for override/error tests).  When ``return_value`` is
+    ``None`` (default) it parses the context from the input messages
+    and builds a *faithful* ``ReportOutput`` — the mock "follows
+    instructions" just as a well-behaved LLM should.
+
+    Tracks ``call_count`` so tests can verify retry behaviour without
+    inspecting log output or timing.  Fires any ``on_llm_end`` callbacks
+    in ``config`` so the ``CostTrackingHandler`` writes a cost event —
+    matching the pattern expected by ``_build_callback_config``.
+
+    Mirrors the ``_MockStructuredLLM`` / ``_MockFeasibilityLLM`` /
+    ``_MockFinancialLLM`` pattern used for REQ-004/005/006.
+    """
+
+    def __init__(
+        self,
+        return_value: Any | None = None,
+        raise_exc: BaseException | None = None,
+    ) -> None:
+        self._return_value = return_value
+        self._raise_exc = raise_exc
+        self.call_count = 0
+
+    async def ainvoke(
+        self, messages: list, config: dict | None = None, **kwargs: Any
+    ) -> Any:
+        self.call_count += 1
+
+        # Fire callbacks BEFORE the raise check so schema-validation
+        # retries still trigger CostTrackingHandler (on_llm_end fires
+        # after the raw LLM call succeeds, even if structured-output
+        # parsing fails).  Arrange the exception AFTER callbacks so the
+        # cost-tracker actually writes the row for the attempt.
+        if config:
+            from langchain_core.outputs import Generation, LLMResult
+
+            handlers = config.get("callbacks", [])
+            if handlers:
+                llm_result = LLMResult(
+                    generations=[[Generation(text="mock")]],
+                    llm_output={
+                        "model_name": "gemini-2.5-flash",
+                        "token_usage": {
+                            "prompt_tokens": 100,
+                            "completion_tokens": 50,
+                        },
+                    },
+                )
+                for h in handlers:
+                    if hasattr(h, "on_llm_end"):
+                        await h.on_llm_end(llm_result)
+
+        if self._raise_exc:
+            raise self._raise_exc
+
+        # Build faithful output when no canned return_value is set.
+        output = (
+            self._return_value
+            if self._return_value is not None
+            else _build_faithful_output(messages)
+        )
+
+        return output
+
+
+def _make_report_output(
+    go_no_go: str = "GO",
+    effective_score: float = 82.0,
+    is_analyst_override: bool = False,
+    analyst_note: str | None = None,
+    risk_count: int = 2,
+) -> Any:
+    """Build a ``ReportOutput`` with the given overrides.
+
+    Returns a properly constructed Pydantic object.  Used by multiple
+    fixtures below so the canned values stay in one place.
+    """
+    from app.agents.skills.report_synthesis import (
+        GoNoGo,
+        ReportOutput,
+        RiskSummaryItem,
+    )
+
+    risks = [
+        RiskSummaryItem(
+            category="fidic",
+            severity="high",
+            description="Standard delay damages clause with 10% cap.",
+        ),
+        RiskSummaryItem(
+            category="lg_bond",
+            severity="medium",
+            description="Standard 5% performance bond requirement.",
+        ),
+    ]
+    if risk_count == 7:
+        risks = risks * 3 + [risks[0]]  # 7 items total
+        risks = risks[:7]
+
+    return ReportOutput(
+        go_no_go=GoNoGo(go_no_go),
+        effective_score=effective_score,
+        is_analyst_override=is_analyst_override,
+        executive_summary=(
+            "This tender covers road construction in Egypt with a contract "
+            "value of EGP 35M and a duration of 24 months. The overall "
+            "recommendation is GO with a feasibility score of 82 out of 100. "
+            "Two risk findings were identified in the medium range. The "
+            "financial profile is comfortable and within company capacity."
+        ),
+        recommendation=(
+            "We recommend proceeding with a bid for this tender."
+        ),
+        risk_summary=risks[:risk_count],
+        feasibility_highlights=[
+            "Technical Fit: 18/20 — strong alignment with company specialisations.",
+            "Financial Capacity: 16/20 — adequate bonding capacity.",
+            "Geographic Scope: 20/20 — perfect geographic fit.",
+        ],
+        financial_highlights=[
+            "Contract value: EGP 35,000,000.",
+            "Performance bond: 5% of contract value.",
+            "LD cap at 10% of contract value.",
+        ],
+        analyst_note=analyst_note,
+    )
+
+
+@pytest_asyncio.fixture
+async def mock_report_llm(monkeypatch: Any) -> _MockReportLLM:
+    """Fixture: patches report_assembler._build_llm with a faithful mock.
+
+    The mock parses the context from input messages and returns a
+    ``ReportOutput`` that matches (faithful LLM behaviour).  Tests
+    that need a specific canned return value can set
+    ``mock.call_count`` (read-only) or patch manually.
+    """
+    mock = _MockReportLLM()
+    monkeypatch.setattr(
+        "app.agents.nodes.report_assembler._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_report_llm_override(monkeypatch: Any) -> _MockReportLLM:
+    """Fixture: patches report_assembler._build_llm, is_analyst_override=True.
+
+    Returns:
+        go_no_go="REVIEW", effective_score=65.0, is_analyst_override=True,
+        analyst_note="Feasibility score adjusted from 35 to 65 by analyst review."
+    """
+    output = _make_report_output(
+        go_no_go="REVIEW",
+        effective_score=65.0,
+        is_analyst_override=True,
+        analyst_note=(
+            "Feasibility score adjusted from 35 to 65 by analyst review."
+        ),
+    )
+    mock = _MockReportLLM(return_value=output)
+    monkeypatch.setattr(
+        "app.agents.nodes.report_assembler._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_report_llm_malformed(monkeypatch: Any) -> _MockReportLLM:
+    """Fixture: patches report_assembler._build_llm to fail schema validation."""
+    mock = _MockReportLLM(
+        raise_exc=OutputParserException(
+            "Failed to parse LLM output as ReportOutput"
+        )
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.report_assembler._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_report_llm_api_error(monkeypatch: Any) -> _MockReportLLM:
+    """Fixture: patches report_assembler._build_llm to raise API errors."""
+    mock = _MockReportLLM(
+        raise_exc=Exception("Simulated API connection error")
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.report_assembler._build_llm", lambda: mock
+    )
+    return mock
+
+
 # ---- REQ-007 HITL Override Gate fixtures -------------------------------
 
 
@@ -1365,4 +1633,227 @@ def sample_financial_chunks() -> list[dict]:
             "chunk_index": 5,
         },
     ]
+
+
+@pytest_asyncio.fixture
+async def complete_run_fixture(
+    app_client: Any,
+    db: AsyncSession,
+    company_with_profile: Any,
+    auth_headers: Any,
+    mock_llm: Any,
+    mock_feasibility_llm: Any,
+    mock_financial_llm: Any,
+    mock_report_llm: _MockReportLLM,
+    profile_lookup_session: None,
+    monkeypatch: Any,
+) -> dict:
+    """Create a tender + run that reaches ``state='complete'``.
+
+    Runs the full LangGraph pipeline (risk_radar → scorer → financial →
+    aggregator → HITL interrupt → resume with approval →
+    report_assembler) with mocked LLM nodes.  The returned dict provides
+    everything a test needs to make API calls:
+
+        tender_id, run_id, company, raw_key
+
+    The ``agent_trace`` on the ``AnalysisRun`` row contains the
+    ``report_assembler`` key so ``GET /tenders/{id}/report`` returns 200.
+
+    NOTE: patches ``report_assembler.with_session`` so the cost tracker
+    writes into the per-test transaction.
+    """
+    import asyncio
+    from uuid import uuid4
+
+    from app.agents.graph import graph
+    from app.agents.state import TenderState
+    from app.config import get_settings
+    from app.db.models import AnalysisRun, Tender, TenderChunk
+    from sqlalchemy import func, update
+
+    from app.routers.tenders import _flatten_financial_summary
+
+    company, raw_key = company_with_profile
+    EMBEDDING_STUB = [0.01] * get_settings().embedding_dimensions
+
+    # ── Mock embeddings ─────────────────────────────────────────────
+    class _MockEmbeddings:
+        def embed_documents(self, texts: list) -> list:
+            return [[0.01] * get_settings().embedding_dimensions for _ in texts]
+
+        def embed_query(self, text: str) -> list:
+            return [0.01] * get_settings().embedding_dimensions
+
+    monkeypatch.setattr(
+        "app.agents.retrieval.get_embeddings_client", lambda: _MockEmbeddings()
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.risk_radar.get_embeddings_client", lambda: _MockEmbeddings()
+    )
+
+    # ── Patch report_assembler.with_session to use test DB ──────────
+    class _TestSessionCtx:
+        async def __aenter__(self) -> Any:
+            return db
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        "app.agents.nodes.report_assembler.with_session",
+        lambda: _TestSessionCtx(),
+    )
+
+    # ── Create tender + chunks ──────────────────────────────────────
+    tender = Tender(
+        id=str(uuid4()),
+        company_id=company.id,
+        filename="complete_test.pdf",
+        storage_path="/tmp/complete_test.pdf",
+        file_size_bytes=100,
+        status="ready",
+    )
+    db.add(tender)
+    await db.flush()
+
+    for i in range(3):
+        chunk = TenderChunk(
+            id=str(uuid4()),
+            tender_id=tender.id,
+            company_id=company.id,
+            chunk_index=i,
+            content=f"Complete test chunk {i} content.",
+            detected_language="en",
+            embedding=EMBEDDING_STUB,
+        )
+        db.add(chunk)
+    await db.flush()
+
+    # ── Create analysis run ─────────────────────────────────────────
+    run = AnalysisRun(
+        id=str(uuid4()),
+        tender_id=tender.id,
+        company_id=company.id,
+        state="pending",
+    )
+    db.add(run)
+    await db.flush()
+    run_id = run.id
+    await db.commit()
+
+    chunks_for_state = [
+        {
+            "content": f"Complete test chunk {i} content.",
+            "detected_language": "en",
+            "chunk_index": i,
+        }
+        for i in range(3)
+    ]
+
+    # ── Run graph to aggregator (HITL interrupt) ────────────────────
+    initial_state = TenderState(
+        tender_id=str(tender.id),
+        run_id=str(run_id),
+        company_id=str(company.id),
+        chunks=chunks_for_state,
+        supervisor_ready=False,
+        risk_findings=[],
+        feasibility_score=None,
+        feasibility_breakdown=None,
+        financial_summary=None,
+        aggregated_results=None,
+        hitl_approved=False,
+        hitl_override_score=None,
+        final_report=None,
+        token_usage=[],
+        source_languages=[],
+    )
+    config = {"configurable": {"thread_id": str(run_id)}}
+
+    saw_aggregator = False
+    async for event in graph.astream(initial_state, config):
+        node_name = list(event.keys())[0]
+        if node_name.startswith("__"):
+            continue
+        if node_name == "aggregator":
+            saw_aggregator = True
+
+    if not saw_aggregator:
+        pytest.fail("Graph did not reach the aggregator — HITL gate not hit")
+
+    # ── Persist findings + financial commitments ────────────────────
+    final_checkpoint = await graph.aget_state(config)
+    findings = (
+        (final_checkpoint.values.get("risk_findings", []) or [])
+        if final_checkpoint else []
+    )
+    financial_summary = (
+        (final_checkpoint.values.get("financial_summary", {}) or {})
+        if final_checkpoint else {}
+    )
+
+    if findings:
+        from sqlalchemy import insert as sql_insert
+        from app.db.models import RiskFinding
+
+        await db.execute(
+            sql_insert(RiskFinding).values([
+                {
+                    "run_id": run_id,
+                    "category": f["category"],
+                    "severity": f["severity"],
+                    "clause_text": f["clause_text"],
+                    "explanation": f["explanation"],
+                    "source_chunk_index": f["source_chunk_index"],
+                    "confidence": f["confidence"],
+                }
+                for f in findings
+            ])
+        )
+
+    if "error" not in (financial_summary or {}):
+        commitment_rows = _flatten_financial_summary(financial_summary, run_id)
+        if commitment_rows:
+            from sqlalchemy import insert as sql_insert
+            from app.db.models import FinancialCommitment
+
+            await db.execute(
+                sql_insert(FinancialCommitment).values(commitment_rows)
+            )
+
+    await db.commit()
+
+    # ── Inject HITL approval and resume graph ───────────────────────
+    await graph.aupdate_state(config, {"hitl_approved": True})
+
+    async for event in graph.astream(None, config):
+        node_name = list(event.keys())[0]
+        if node_name.startswith("__"):
+            continue
+        await db.execute(
+            update(AnalysisRun)
+            .where(AnalysisRun.id == run_id)
+            .values(
+                agent_trace=AnalysisRun.agent_trace.concat(
+                    {node_name: event[node_name]}
+                )
+            )
+        )
+        await db.commit()
+
+    # ── Set state to complete ───────────────────────────────────────
+    await db.execute(
+        update(AnalysisRun)
+        .where(AnalysisRun.id == run_id)
+        .values(state="complete", completed_at=func.now())
+    )
+    await db.commit()
+
+    return {
+        "tender_id": tender.id,
+        "run_id": run_id,
+        "company": company,
+        "raw_key": raw_key,
+    }
 
