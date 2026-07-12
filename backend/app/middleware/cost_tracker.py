@@ -87,6 +87,21 @@ class CostTrackingHandler(BaseCallbackHandler):
                 )
             )
             await self.db.commit()
+
+            try:
+                from app.services.event_bus import get_event_bus
+                from app.schemas.stream import make_event
+                bus = get_event_bus()
+                await bus.publish_event(
+                    self.run_id,
+                    make_event(
+                        self.run_id, "cost_update",
+                        node_name=self.node_name,
+                        data={"cost_usd": round(cost_usd, 6)},
+                    )
+                )
+            except Exception:
+                pass
         except Exception:
             logger.warning(
                 "cost_tracking_failed run_id=%s node_name=%s",

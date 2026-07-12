@@ -58,7 +58,9 @@ from app.schemas.analysis import (
     RiskSummaryItemResponse,
     RunStatusResponse,
 )
+from app.schemas.stream import make_event
 from app.schemas.tender import TenderDetailResponse, TenderUploadResponse
+from app.services.event_bus import get_event_bus
 from app.services.storage import save_upload
 from app.services.validation import reject_oversize_declared, sanitize_filename, validate_upload
 
@@ -250,6 +252,8 @@ async def run_graph(
             }
 
             saw_aggregator = False
+            event_bus = get_event_bus()
+            run_id_str = str(run_id)
             async for event in graph.astream(initial_state, config):
                 node_name = list(event.keys())[0]
                 # LangGraph internal events (e.g., __interrupt__ from the HITL gate)
@@ -258,6 +262,12 @@ async def run_graph(
                     continue
                 if node_name == "aggregator":
                     saw_aggregator = True
+
+                await event_bus.publish_event(run_id_str, make_event(
+                    run_id_str, "node_started",
+                    node_name=node_name,
+                ))
+
                 await db.execute(
                     update(AnalysisRun)
                     .where(AnalysisRun.id == run_id)
@@ -266,6 +276,11 @@ async def run_graph(
                     )
                 )
                 await db.commit()
+
+                await event_bus.publish_event(run_id_str, make_event(
+                    run_id_str, "node_completed",
+                    node_name=node_name,
+                ))
 
             if saw_aggregator:
                 # Graph reached the interrupt_before=["report_assembler"] gate.
@@ -336,6 +351,18 @@ async def run_graph(
                 # + UPDATE land atomically across all four operations.
                 await db.commit()
 
+                await event_bus.publish_event(run_id_str, make_event(
+                    run_id_str, "awaiting_hitl",
+                    data={
+                        "feasibility_score": final_checkpoint.values.get(
+                            "feasibility_score"
+                        ),
+                        "risk_count": len(
+                            final_checkpoint.values.get("risk_findings", [])
+                        ),
+                    }
+                ))
+
                 # Log metadata only — NEVER clause_text, explanation, amount_value
                 # or amount_currency (REQ-004 / REQ-006 Security NFR,
                 # ai-security T5).
@@ -390,9 +417,20 @@ async def _resume_graph(
     """
     from app.agents.graph import graph
 
+    event_bus = get_event_bus()
+    run_id_str = str(run_id)
+
     async with with_session() as db:
         try:
-            config = {"configurable": {"thread_id": str(run_id)}}
+            await event_bus.publish_event(run_id_str, make_event(
+                run_id_str, "resuming",
+                data={
+                    "action": "overridden" if override_score is not None else "approved",
+                    "effective_score": override_score,
+                }
+            ))
+
+            config = {"configurable": {"thread_id": run_id_str}}
 
             update_values: dict = {"hitl_approved": True}
             if override_score is not None:
@@ -422,7 +460,21 @@ async def _resume_graph(
             )
             await db.commit()
 
+            final_state = await graph.aget_state(config)
+            report = (final_state.values.get("final_report", {}) if final_state is not None else {}) or {}
+            await event_bus.publish_event(run_id_str, make_event(
+                run_id_str, "complete",
+                data={
+                    "go_no_go": report.get("go_no_go", "REVIEW"),
+                    "effective_score": report.get("effective_score", 0.0),
+                }
+            ))
+
         except Exception as e:
+            await event_bus.publish_event(run_id_str, make_event(
+                run_id_str, "failed",
+                data={"error_reason": str(e)}
+            ))
             await db.execute(
                 update(AnalysisRun)
                 .where(AnalysisRun.id == run_id)

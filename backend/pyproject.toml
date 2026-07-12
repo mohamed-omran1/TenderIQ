@@ -42,6 +42,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "httpx",                   # الـ Async TestClient لـ FastAPI
+    "httpx_ws",                # WebSocket testing for FastAPI
     "anyio",
     "fakeredis",               # عشان التيست يقدر يشتغل من غير ما يقوم راديس حقيقي
     "reportlab",                # عشان تكريت ملفات PDF وهمية جوه الـ Tests

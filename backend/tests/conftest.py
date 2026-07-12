@@ -26,6 +26,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 # `fakeredis` provides an in-process async Redis for deterministic rate-limit tests.
 import fakeredis.aioredis
 
+# Register custom markers
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: tests that take longer than a few seconds (e.g. heartbeat)")
+
 from app.agents.skills.feasibility_scoring import (
     DimensionScore,
     FeasibilityOutput,
@@ -1855,5 +1859,131 @@ async def complete_run_fixture(
         "run_id": run_id,
         "company": company,
         "raw_key": raw_key,
+    }
+
+
+# ---- REQ-009 Slice 5 (QA) — WebSocket test fixtures -------------------------
+
+
+@pytest_asyncio.fixture
+async def redis_client() -> AsyncIterator[Any]:
+    """Real async Redis client for EventBus tests.
+
+    Connects to REDIS_URL from env (falls back to settings.redis_url).
+    Flushes test-prefixed keys (``run:*``) after each test.
+    The production EventBus tests require a real Redis, not fakeredis.
+    """
+    import redis.asyncio as aioredis
+
+    REDIS_URL = os.environ.get("REDIS_URL", settings.redis_url)
+    client = aioredis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+    try:
+        yield client
+    finally:
+        keys = await client.keys("run:*")
+        if keys:
+            await client.delete(*keys)
+        await client.aclose()
+
+
+@pytest_asyncio.fixture
+async def ws_app(db: AsyncSession) -> AsyncIterator[Any]:
+    """FastAPI app for WebSocket testing.
+
+    - Initialises the EventBus singleton with real Redis (lifespan does not run
+      for WebSocket-only ASGI scopes, so we do it manually).
+    - Overrides ``get_session`` with the per-test transactional session.
+    - Yields the app; cleans up the EventBus singleton at teardown.
+    """
+    import app.services.event_bus as eb_module
+
+    app = create_app()
+
+    # Manually initialise EventBus — the lifespan context manager won't run
+    # when ASGIWebSocketTransport sends a ``websocket`` scope directly.
+    eb_module.event_bus = eb_module.EventBus(redis_url=settings.redis_url)
+    await eb_module.event_bus.connect()
+
+    async def _override_session() -> AsyncSession:
+        yield db
+
+    app.dependency_overrides[get_session] = _override_session
+    try:
+        yield app
+    finally:
+        app.dependency_overrides.clear()
+        if eb_module.event_bus:
+            await eb_module.event_bus.disconnect()
+            eb_module.event_bus = None
+
+
+@pytest_asyncio.fixture
+async def active_run(
+    db: AsyncSession,
+    company_with_profile: tuple[Company, str],
+) -> dict:
+    """Create a tender, chunks, and an analysis run in ``running`` state.
+
+    Returns::
+
+        {
+            "run_id": str,
+            "tender_id": str,
+            "company_id": str,
+            "company_api_key": str,
+        }
+
+    The run is set to ``running`` so the WebSocket endpoint will accept
+    connections and wait for events.  No graph execution happens — callers
+    publish events or trigger the graph separately.
+    """
+    from uuid import uuid4
+
+    from app.db.models import AnalysisRun
+    from app.config import get_settings
+
+    company, raw_key = company_with_profile
+    EMBEDDING_STUB = [0.01] * get_settings().embedding_dimensions
+
+    tender = Tender(
+        id=str(uuid4()),
+        company_id=company.id,
+        filename="ws_test.pdf",
+        storage_path="/tmp/ws_test.pdf",
+        file_size_bytes=100,
+        status="ready",
+    )
+    db.add(tender)
+    await db.flush()
+
+    for i in range(3):
+        chunk = TenderChunk(
+            id=str(uuid4()),
+            tender_id=tender.id,
+            company_id=company.id,
+            chunk_index=i,
+            content=f"WS test chunk {i} content for streaming tests.",
+            detected_language="en",
+            embedding=EMBEDDING_STUB,
+        )
+        db.add(chunk)
+    await db.flush()
+
+    run = AnalysisRun(
+        id=str(uuid4()),
+        tender_id=tender.id,
+        company_id=company.id,
+        state="running",
+    )
+    db.add(run)
+    await db.flush()
+    run_id = run.id
+    await db.commit()
+
+    return {
+        "run_id": run_id,
+        "tender_id": tender.id,
+        "company_id": company.id,
+        "company_api_key": raw_key,
     }
 

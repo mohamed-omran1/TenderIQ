@@ -23,7 +23,8 @@ from fastapi.responses import JSONResponse
 from app.agents.graph import graph
 from app.config import get_settings
 from app.errors import ApiError, RateLimited
-from app.routers import analytics, company, tenders
+from app.routers import analytics, company, stream, tenders
+import app.services.event_bus as event_bus_module
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,7 +36,18 @@ logging.basicConfig(
 async def lifespan(app: FastAPI):
     # REQ-003: ensure LangGraph Postgres checkpoint tables exist on startup.
     await graph.checkpointer.setup()
+
+    # REQ-009: initialise Redis pub/sub event bus.
+    settings = get_settings()
+    event_bus_module.event_bus = event_bus_module.EventBus(
+        redis_url=settings.redis_url
+    )
+    await event_bus_module.event_bus.connect()
+
     yield
+
+    if event_bus_module.event_bus:
+        await event_bus_module.event_bus.disconnect()
 
 
 def create_app() -> FastAPI:
@@ -71,6 +83,7 @@ def create_app() -> FastAPI:
     app.include_router(tenders.router)
     app.include_router(company.router)
     app.include_router(analytics.router)
+    app.include_router(stream.router)
 
     @app.get("/health", tags=["ops"])
     async def health() -> dict[str, str]:

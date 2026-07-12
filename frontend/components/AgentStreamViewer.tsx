@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useRunStream } from "@/hooks/useRunStream";
 import {
   getRunStatus,
   type RunState,
@@ -45,7 +46,12 @@ function inferNodeStatus(
   nodeKey: string,
   agentTrace: Record<string, unknown>,
   runState: RunState,
+  currentlyRunning: string | null,
+  completedNodes: Set<string>,
 ): NodeStatus {
+  if (completedNodes.has(nodeKey)) return "COMPLETE";
+  if (currentlyRunning === nodeKey) return "RUNNING";
+
   if (nodeKey in agentTrace) return "COMPLETE";
 
   const isActive = runState === "pending" || runState === "running";
@@ -101,16 +107,43 @@ export default function AgentStreamViewer({
   tenderId,
 }: AgentStreamViewerProps) {
   const [elapsed, setElapsed] = useState(0);
+  const [currentlyRunning, setCurrentlyRunning] = useState<string | null>(null);
+  const [completedNodes, setCompletedNodes] = useState<Set<string>>(new Set());
+
+  const { latestEvent, connectionState } = useRunStream(tenderId);
 
   const { data, isError, error } = useQuery<RunStatusResponse>({
     queryKey: ["run-status", tenderId],
     queryFn: () => getRunStatus(tenderId),
-    refetchInterval: (query) =>
-      query.state.data?.state === "pending" ||
-      query.state.data?.state === "running"
-        ? 2000
-        : false,
+    refetchInterval: (query) => {
+      if (connectionState !== "error") return false;
+      if (
+        query.state.data?.state === "pending" ||
+        query.state.data?.state === "running"
+      ) {
+        return 2000;
+      }
+      return false;
+    },
   });
+
+  useEffect(() => {
+    if (!latestEvent) return;
+    if (
+      latestEvent.event_type === "node_started" &&
+      latestEvent.node_name
+    ) {
+      setCurrentlyRunning(latestEvent.node_name);
+    }
+    if (
+      latestEvent.event_type === "node_completed" &&
+      latestEvent.node_name
+    ) {
+      setCompletedNodes(
+        (prev) => new Set([...prev, latestEvent.node_name!]),
+      );
+    }
+  }, [latestEvent]);
 
   useEffect(() => {
     if (!data?.started_at) return;
@@ -160,11 +193,14 @@ export default function AgentStreamViewer({
         <CardHeader>
           <CardTitle className="flex items-center justify-between">
             <span>Analysis Status</span>
-            {data.started_at && (
-              <span className="text-sm font-normal text-slate-500">
-                {formatElapsed(elapsed)}
-              </span>
-            )}
+            <div className="flex items-center gap-3">
+              <ConnectionIndicator connectionState={connectionState} />
+              {data.started_at && (
+                <span className="text-sm font-normal text-slate-500">
+                  {formatElapsed(elapsed)}
+                </span>
+              )}
+            </div>
           </CardTitle>
         </CardHeader>
         <CardContent>
@@ -200,7 +236,7 @@ export default function AgentStreamViewer({
         <CardContent>
           <div className="space-y-3">
             {NODE_KEYS.map((key) => {
-              const status = inferNodeStatus(key, data.agent_trace, data.state);
+              const status = inferNodeStatus(key, data.agent_trace, data.state, currentlyRunning, completedNodes);
               return (
                 <NodeRow key={key} label={NODE_LABELS[key]} status={status} />
               );
@@ -244,4 +280,50 @@ function NodeRow({
       </span>
     </div>
   );
+}
+
+function ConnectionIndicator({
+  connectionState,
+}: {
+  connectionState: string;
+}) {
+  if (connectionState === "closed" || connectionState === "connecting") {
+    return null;
+  }
+
+  if (connectionState === "connected") {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-600">
+        <span className="relative flex size-2">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+          <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+        </span>
+        Live
+      </span>
+    );
+  }
+
+  if (connectionState === "reconnecting") {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-600">
+        <span className="relative flex size-2">
+          <span className="inline-flex size-2 rounded-full bg-amber-500" />
+        </span>
+        Reconnecting…
+      </span>
+    );
+  }
+
+  if (connectionState === "error") {
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500">
+        <span className="relative flex size-2">
+          <span className="inline-flex size-2 rounded-full bg-slate-400" />
+        </span>
+        Polling
+      </span>
+    );
+  }
+
+  return null;
 }

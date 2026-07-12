@@ -29,6 +29,7 @@ import {
   type HITLResponse,
 } from "@/lib/api/hitl";
 import { getFinancialCommitments } from "@/lib/api/financial";
+import { useRunStream } from "@/hooks/useRunStream";
 
 type ScoreBand = "red" | "amber" | "green";
 type PaletteEntry = { bg: string; text: string; label: string };
@@ -67,6 +68,10 @@ export default function HITLGate({
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [justificationError, setJustificationError] = useState<string | null>(
     null,
+  );
+
+  const { latestEvent, connectionState } = useRunStream(
+    runState === "resuming" ? tenderId : null,
   );
 
   const handleToggleAdjust = useCallback(() => {
@@ -158,7 +163,10 @@ export default function HITLGate({
     queryKey: ["hitl-poll", tenderId],
     queryFn: () => getRunStatus(tenderId),
     enabled: submitted,
-    refetchInterval: 3000,
+    refetchInterval:
+      connectionState === "error" && runState === "resuming"
+        ? 3000
+        : false,
   });
 
   const { data: financialData } = useQuery({
@@ -168,6 +176,12 @@ export default function HITLGate({
 
   const needsReviewCount =
     financialData?.filter((c) => c.needs_review).length ?? 0;
+
+  useEffect(() => {
+    if (latestEvent?.event_type === "complete") {
+      onApproved();
+    }
+  }, [latestEvent, onApproved]);
 
   const polledComplete = pollingStatus?.state === "complete";
 

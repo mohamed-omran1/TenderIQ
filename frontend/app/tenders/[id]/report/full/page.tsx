@@ -25,7 +25,7 @@
  * "Back to overview" navigation.
  */
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   QueryClient,
   QueryClientProvider,
@@ -36,6 +36,7 @@ import Link from "next/link";
 import { AlertCircle, ArrowLeft, Loader2 } from "lucide-react";
 
 import FullReportView, { FullReportSkeleton } from "@/components/FullReportView";
+import { useRunStream } from "@/hooks/useRunStream";
 import {
   getReport,
   ApiError,
@@ -68,6 +69,8 @@ function FullReportPageBody() {
   const params = useParams<{ id: string }>();
   const tenderId = params.id;
 
+  const { latestEvent, connectionState } = useRunStream(tenderId);
+
   const {
     data: report,
     isLoading,
@@ -79,14 +82,19 @@ function FullReportPageBody() {
     queryFn: () => getReport(tenderId),
     enabled: !!tenderId,
     refetchInterval: (query) => {
-      // Poll every 4 seconds only while the report is not yet ready
-      // (404 → null). Once available, stop polling — the data is final.
+      if (connectionState !== "error") return false;
       const data = query.state.data;
       if (data === undefined) return 4_000;
       if (data === null) return 4_000;
       return false;
     },
   });
+
+  useEffect(() => {
+    if (latestEvent?.event_type === "complete") {
+      void refetch();
+    }
+  }, [latestEvent, refetch]);
 
   return (
     <main className="mx-auto max-w-4xl px-4 py-8 space-y-6">
@@ -99,7 +107,7 @@ function FullReportPageBody() {
       ) : report === null || report === undefined ? (
         <NotReadyState />
       ) : (
-        <FullReportView report={report} />
+        <FullReportView report={report} refetch={() => void refetch()} />
       )}
     </main>
   );

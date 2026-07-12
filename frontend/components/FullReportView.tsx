@@ -31,7 +31,7 @@
  * Colours follow the same hex tokens as RiskRadarTable / FeasibilityScoreCard.
  */
 
-import { useCallback } from "react";
+import { useCallback, useEffect } from "react";
 import {
   AlertTriangle,
   CalendarClock,
@@ -42,6 +42,7 @@ import {
 } from "lucide-react";
 
 import GoNoGoBadge from "@/components/GoNoGoBadge";
+import { useRunStream } from "@/hooks/useRunStream";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -53,6 +54,7 @@ import type {
 
 interface FullReportViewProps {
   report: ReportResponse;
+  refetch?: () => void;
 }
 
 /** Severity ordering for the risk table — matches RiskRadarTable. */
@@ -108,7 +110,15 @@ function isFallbackReport(
   return typeof (report as { error?: unknown }).error === "string";
 }
 
-export default function FullReportView({ report }: FullReportViewProps) {
+export default function FullReportView({ report, refetch }: FullReportViewProps) {
+  const { latestEvent } = useRunStream(refetch ? report.tender_id : null);
+
+  useEffect(() => {
+    if (latestEvent?.event_type === "complete" && refetch) {
+      refetch();
+    }
+  }, [latestEvent, refetch]);
+
   const handlePrint = useCallback(() => {
     if (typeof window !== "undefined") {
       window.print();
