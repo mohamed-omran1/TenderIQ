@@ -55,6 +55,7 @@ import json
 import logging
 from typing import Any
 
+from langchain_core.callbacks import BaseCallbackManager
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -67,6 +68,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from app.config import get_settings
 from app.agents.skills.report_synthesis import (
     FALLBACK_REPORT,
     REPORT_FEW_SHOT_EXAMPLES,
@@ -305,7 +307,7 @@ def _build_llm() -> Any:
     definitions, so the nested Pydantic schema
     (``ReportOutput`` → ``list[RiskSummaryItem]``) is supported natively.
     """
-    llm = ChatGoogleGenerativeAI(model=_LLM_MODEL)
+    llm = ChatGoogleGenerativeAI(model=_LLM_MODEL, google_api_key=get_settings().google_api_key)
     return llm.with_structured_output(ReportOutput, method="json_schema")  # type: ignore[return-value]
 
 
@@ -328,6 +330,8 @@ def _build_callback_config(
         merged = [handler]
     elif isinstance(existing, list):
         merged = list(existing) + [handler]
+    elif isinstance(existing, BaseCallbackManager):
+        merged = list(existing.handlers) + [handler]
     else:
         merged = [existing, handler]
     base["callbacks"] = merged

@@ -51,6 +51,7 @@ import json
 import logging
 from typing import Any
 
+from langchain_core.callbacks import BaseCallbackManager
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -64,6 +65,7 @@ from tenacity import (
 )
 
 from app.agents.retrieval import retrieve_scope_relevant_chunks
+from app.config import get_settings
 from app.agents.skills.feasibility_scoring import (
     FEASIBILITY_SYSTEM_PROMPT,
     FEW_SHOT_EXAMPLES,
@@ -218,7 +220,7 @@ def _build_llm() -> Any:
     `method="json_schema"` is the recommended Gemini path for reliable
     structured output (langchain-google docs, 2026).
     """
-    llm = ChatGoogleGenerativeAI(model=_LLM_MODEL)
+    llm = ChatGoogleGenerativeAI(model=_LLM_MODEL, google_api_key=get_settings().google_api_key)
     return llm.with_structured_output(FeasibilityOutput, method="json_schema")  # type: ignore[return-value]
 
 
@@ -241,6 +243,8 @@ def _build_callback_config(
         merged = [handler]
     elif isinstance(existing, list):
         merged = list(existing) + [handler]
+    elif isinstance(existing, BaseCallbackManager):
+        merged = list(existing.handlers) + [handler]
     else:
         merged = [existing, handler]
     base["callbacks"] = merged

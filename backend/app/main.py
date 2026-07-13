@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 from app.agents.graph import graph
 from app.config import get_settings
 from app.errors import ApiError, RateLimited
-from app.routers import analytics, company, stream, tenders
+from app.routers import analytics, company, eval, stream, tenders
 import app.services.event_bus as event_bus_module
 
 logging.basicConfig(
@@ -84,6 +84,7 @@ def create_app() -> FastAPI:
     app.include_router(company.router)
     app.include_router(analytics.router)
     app.include_router(stream.router)
+    app.include_router(eval.router, prefix="/eval", tags=["eval"])
 
     @app.get("/health", tags=["ops"])
     async def health() -> dict[str, str]:

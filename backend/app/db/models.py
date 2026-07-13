@@ -470,6 +470,42 @@ class FinancialCommitment(Base):
     )
 
 
+class EvalResult(Base):
+    """One row per evaluation run — append-only history log for regression tracking (REQ-012).
+
+    Stores the full EvalRunResult as JSONB. Rows are never updated or deleted.
+    The eval_run_id in the JSON always starts with "eval-".
+    """
+
+    __tablename__ = "eval_results"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, server_default=text("gen_random_uuid()::text")
+    )
+    company_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("companies.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tender_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("tenders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    result: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    overall_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    total_cost_usd: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0, server_default=text("0.0")
+    )
+    run_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_eval_results_company_runat", "company_id", "run_at"),
+    )
+
+
 class HITLOverride(Base):
     """Immutable audit log of a human-in-the-loop decision (REQ-007).
 

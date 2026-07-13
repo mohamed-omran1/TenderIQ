@@ -1,0 +1,6 @@
+- generic [active] [ref=e1]:
+  - main [ref=e2]:
+    - generic [ref=e3]:
+      - heading "Company Profile" [level=1] [ref=e4]
+      - paragraph [ref=e5]: This profile is used by the Feasibility Scorer to evaluate tender fit against your company's capabilities.
+  - button "Open Next.js Dev Tools" [ref=e28] [cursor=pointer]

@@ -30,6 +30,7 @@ import json
 import logging
 from typing import Any
 
+from langchain_core.callbacks import BaseCallbackManager
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -43,6 +44,7 @@ from tenacity import (
 )
 
 from app.agents.embeddings import get_embeddings_client
+from app.config import get_settings
 from app.agents.retrieval import retrieve_risk_relevant_chunks
 from app.agents.skills.risk_clause_extraction import (
     FEW_SHOT_EXAMPLES,
@@ -157,7 +159,7 @@ def _build_llm() -> ChatGoogleGenerativeAI:
     structured output (langchain-google docs, 2025). The model's own
     `GOOGLE_API_KEY` env var is picked up automatically.
     """
-    llm = ChatGoogleGenerativeAI(model=_LLM_MODEL)
+    llm = ChatGoogleGenerativeAI(model=_LLM_MODEL, google_api_key=get_settings().google_api_key)
     return llm.with_structured_output(RiskRadarOutput, method="json_schema")  # type: ignore[return-value]
 
 
@@ -180,6 +182,8 @@ def _build_callback_config(
         merged = [handler]
     elif isinstance(existing, list):
         merged = list(existing) + [handler]
+    elif isinstance(existing, BaseCallbackManager):
+        merged = list(existing.handlers) + [handler]
     else:
         merged = [existing, handler]
     base["callbacks"] = merged
