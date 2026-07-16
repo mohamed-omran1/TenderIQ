@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -36,6 +37,7 @@ class RunStatusResponse(BaseModel):
     completed_at: datetime | None = None
     error_reason: str | None = None
     feasibility_score: float | None = None
+    aggregated_results: dict[str, Any] | None = None
     agent_trace: dict = Field(default_factory=dict)
     report_available: bool = False
 

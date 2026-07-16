@@ -1,0 +1,31 @@
+- generic [active] [ref=e1]:
+  - main [ref=e2]:
+    - generic [ref=e3]:
+      - heading "Risk Analysis Report" [level=1] [ref=e4]
+      - paragraph [ref=e5]: "Tender ID: c6e3eb01-aaf6-432b-97ad-4ef78f683372"
+    - paragraph [ref=e9]: This is a preliminary risk review. The full Go/No-Go report will be available after your review and approval below.
+    - generic [ref=e16]:
+      - generic [ref=e17]: Feasibility Score
+      - generic [ref=e19]:
+        - generic "Loading dimension breakdown" [ref=e24]
+        - generic [ref=e55]:
+          - paragraph [ref=e59]: This score is pending your review. You can adjust it before the final report is generated.
+          - generic [ref=e60]:
+            - button "Approve & Adjust Score" [disabled]
+          - paragraph [ref=e61]: HITL approval — coming in REQ-007
+    - generic [ref=e62]: Financial Summary
+    - generic [ref=e85]:
+      - generic [ref=e86]:
+        - generic [ref=e87]: Analyst Review Required
+        - generic [ref=e90]: Review the findings above before generating the final report. You may approve the AI score or adjust it based on your expert judgment.
+      - generic [ref=e91]:
+        - generic [ref=e92]:
+          - paragraph [ref=e93]: AI Feasibility Score
+          - generic [ref=e94]: "0"
+          - paragraph [ref=e96]: / 100
+        - generic [ref=e97]:
+          - checkbox "Adjust score" [ref=e98]
+          - generic [ref=e99] [cursor=pointer]: Adjust score
+        - textbox "Add a note (optional)..." [ref=e101]
+      - button "Approve AI Score" [ref=e103]
+  - button "Open Next.js Dev Tools" [ref=e109] [cursor=pointer]

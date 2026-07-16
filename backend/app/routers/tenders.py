@@ -694,6 +694,13 @@ async def get_analysis_status(
             detail="Not authorised to view this analysis run.",
         )
 
+    aggregated_results = run.aggregated_results
+    if aggregated_results is None:
+        trace = run.agent_trace or {}
+        scorer = trace.get("scorer") or {}
+        if scorer.get("feasibility_breakdown"):
+            aggregated_results = {"feasibility_breakdown": scorer["feasibility_breakdown"]}
+
     return RunStatusResponse(
         run_id=run.id,
         state=run.state,
@@ -701,6 +708,7 @@ async def get_analysis_status(
         completed_at=run.completed_at,
         error_reason=run.error_reason,
         feasibility_score=run.feasibility_score,
+        aggregated_results=aggregated_results,
         agent_trace=run.agent_trace or {},
         # REQ-008 Slice 3: True only when the run is complete AND the
         # report_assembler node has populated agent_trace. The frontend uses

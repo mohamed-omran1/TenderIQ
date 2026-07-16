@@ -3,10 +3,11 @@
 /**
  * FeasibilityScoreCard (REQ-005 Slice 4).
  *
- * Renders the composite feasibility score (0-100), the per-dimension
- * breakdown table (5 rows), and the HITL notice. The card is a
- * pure presentational component — the parent page owns the data fetch
- * via useQuery(getAggregatedResults) and passes the props down.
+ * Renders the composite feasibility score (0-100) and the per-dimension
+ * breakdown table (5 rows). The card is a pure presentational component —
+ * the parent page owns the data fetch via useQuery(getAggregatedResults)
+ * and passes the props down. HITL approval is handled by the separate
+ * <HITLGate> component rendered below this card.
  *
  * Colour rules (imp-slice-04_req-05.md):
  *   0-39   red    bg #FEE2E2 / text #B91C1C
@@ -20,14 +21,11 @@
  *
  * Render order (per spec):
  *   1. If breakdown has the "error" key → amber error banner, hide rest.
- *   2. Else if score is null              → skeleton for Sections A & B,
- *                                            but keep Section C visible.
- *   3. Else                               → full composite + table + HITL.
+ *   2. Else if score is null              → skeleton for Sections A & B.
+ *   3. Else                               → full composite + table.
  */
 
-import { AlertTriangle, Info } from "lucide-react";
-
-import { Button } from "@/components/ui/button";
+import { AlertTriangle } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -150,7 +148,6 @@ export default function FeasibilityScoreCard({
       <CardContent className="space-y-6">
         <SectionA score={hasScore ? score : null} />
         <SectionB breakdown={hasScore ? breakdown : null} />
-        <SectionC />
       </CardContent>
     </Card>
   );
@@ -275,39 +272,4 @@ function DimensionRow({
   );
 }
 
-/* ---------- Section C: HITL Notice ---------- */
 
-function SectionC() {
-  return (
-    <div
-      className="flex flex-col gap-3 rounded-lg border p-3"
-      style={{
-        backgroundColor: "#FEF3C7",
-        borderColor: "#FCD34D",
-        color: "#92400E",
-      }}
-    >
-      <div className="flex items-start gap-2 text-sm">
-        <Info className="mt-0.5 size-4 shrink-0" />
-        <p>
-          This score is pending your review. You can adjust it before the
-          final report is generated.
-        </p>
-      </div>
-      <div className="flex flex-col items-stretch gap-1 sm:flex-row sm:items-center sm:justify-between">
-        <Button
-          disabled
-          aria-disabled
-          title="HITL approval — coming in REQ-007"
-          variant="default"
-          className="sm:ml-auto"
-        >
-          Approve &amp; Adjust Score
-        </Button>
-      </div>
-      <p className="text-xs text-slate-500">
-        HITL approval — coming in REQ-007
-      </p>
-    </div>
-  );
-}
