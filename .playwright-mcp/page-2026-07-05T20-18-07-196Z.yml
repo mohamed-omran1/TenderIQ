@@ -1,0 +1,102 @@
+- generic [active] [ref=e1]:
+  - main [ref=e2]:
+    - generic [ref=e3]:
+      - heading "Risk Analysis Report" [level=1] [ref=e4]
+      - paragraph [ref=e5]: "Tender ID: 22222222-2222-2222-2222-222222222222"
+    - generic [ref=e6]:
+      - img [ref=e7]
+      - paragraph [ref=e9]: This is a preliminary risk review. The full Go/No-Go report will be available after your review and approval below.
+    - generic [ref=e87]: No risk clauses identified in this tender.
+    - generic [ref=e16]:
+      - generic [ref=e18]: Feasibility Score
+      - generic [ref=e19]:
+        - generic "Loading dimension breakdown" [ref=e24]
+        - generic [ref=e55]:
+          - generic [ref=e56]:
+            - img [ref=e57]
+            - paragraph [ref=e59]: This score is pending your review. You can adjust it before the final report is generated.
+          - generic [ref=e60]:
+            - button "Approve & Adjust Score" [disabled]
+          - paragraph [ref=e61]: HITL approval — coming in REQ-007
+    - generic [ref=e88]:
+      - generic [ref=e90]: Financial Summary
+      - generic [ref=e91]:
+        - generic [ref=e92]:
+          - heading "A — Contract Value" [level=3] [ref=e93]
+          - generic [ref=e94]:
+            - generic [ref=e96]: SAR 35,000,000
+            - paragraph [ref=e97]: Total contract value as stated in Section 4 of the tender.
+            - paragraph [ref=e98]: "Source: chunk #3"
+        - generic [ref=e99]:
+          - heading "B — Performance Bonds" [level=3] [ref=e100]
+          - table [ref=e102]:
+            - rowgroup [ref=e103]:
+              - row "Type Amount % of Contract Conditions" [ref=e104]:
+                - columnheader "Type" [ref=e105]
+                - columnheader "Amount" [ref=e106]
+                - columnheader "% of Contract" [ref=e107]
+                - columnheader "Conditions" [ref=e108]
+            - rowgroup [ref=e109]:
+              - row "Performance bond — 10% of contract value, refundable upon completion. SAR 3,500,000 10% Performance bond — 10% of contract value, refundable upon completion." [ref=e110]:
+                - cell "Performance bond — 10% of contract value, refundable upon completion." [ref=e111]
+                - cell "SAR 3,500,000" [ref=e112]:
+                  - generic [ref=e114]: SAR 3,500,000
+                - cell "10%" [ref=e115]
+                - cell "Performance bond — 10% of contract value, refundable upon completion." [ref=e116]
+              - row "Bid bond — 5% of bid price, refundable after award. Amount not specified ⚠ Requires review 5% Bid bond — 5% of bid price, refundable after award." [ref=e117]:
+                - cell "Bid bond — 5% of bid price, refundable after award." [ref=e118]
+                - cell "Amount not specified ⚠ Requires review" [ref=e119]:
+                  - generic [ref=e120]:
+                    - generic [ref=e121]: Amount not specified
+                    - generic [ref=e122]: ⚠ Requires review
+                - cell "5%" [ref=e123]
+                - cell "Bid bond — 5% of bid price, refundable after award." [ref=e124]
+        - generic [ref=e125]:
+          - heading "C — Liquidated Damages" [level=3] [ref=e126]
+          - generic [ref=e128]:
+            - generic [ref=e129]:
+              - generic [ref=e130]: "Rate:"
+              - generic [ref=e131]: SAR 5,000 per day
+            - generic [ref=e132]:
+              - generic [ref=e133]: "Cap:"
+              - generic [ref=e134]: 10% of contract value
+            - paragraph [ref=e135]: Liquidated damages , capped at 10% of contract value.
+            - paragraph [ref=e136]: "Source: chunk #18"
+        - generic [ref=e137]:
+          - heading "D — Payment Schedule" [level=3] [ref=e138]
+          - list [ref=e139]:
+            - listitem [ref=e140]:
+              - generic [ref=e141]:
+                - generic [ref=e142]:
+                  - paragraph [ref=e143]: Final payment
+                  - paragraph [ref=e144]: "Trigger: 20% of contract value, upon project handover."
+                - generic [ref=e145]: 20% of contract value
+            - listitem [ref=e146]:
+              - generic [ref=e147]:
+                - generic [ref=e148]:
+                  - paragraph [ref=e149]: Advance payment
+                  - paragraph [ref=e150]: "Trigger: 30% of contract value, upon contract signing."
+                - generic [ref=e151]: SAR 10,500,000
+            - listitem [ref=e152]:
+              - generic [ref=e153]:
+                - generic [ref=e154]:
+                  - paragraph [ref=e155]: Progress payment
+                  - paragraph [ref=e156]: "Trigger: 40% of contract value, upon completion of substructure."
+                - generic [ref=e157]: 40% of contract value
+        - generic [ref=e158]:
+          - heading "E — Retention" [level=3] [ref=e159]
+          - paragraph [ref=e160]: "Retention: 5% of contract value"
+          - paragraph [ref=e161]: Retention withheld until defects liability period ends (12 months).
+        - generic [ref=e162]:
+          - heading "F — Advance Payment" [level=3] [ref=e163]
+          - generic [ref=e165]: SAR 10,500,000
+          - paragraph [ref=e166]: Advance payment of 30% of contract value, against advance payment guarantee.
+        - status [ref=e167]:
+          - img [ref=e168]
+          - paragraph [ref=e170]: ⚠ 1 item require manual currency verification before using these figures in a bid decision.
+    - generic [ref=e85]:
+      - paragraph [ref=e86]: HITL approval — coming in REQ-007
+      - button "Approve & Generate Full Report" [disabled]
+  - button "Open Next.js Dev Tools" [ref=e176] [cursor=pointer]:
+    - img [ref=e177]
+  - alert [ref=e180]

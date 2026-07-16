@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     # --- CORS (Frontend origin only — never "*" with credentials) ---
     cors_origins: str = Field(default="http://localhost:3000")
 
+    # --- Admin API key (REQ-012 — separate from company API keys) ---
+    admin_api_key: str = Field(default="")
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def max_upload_bytes(self) -> int:

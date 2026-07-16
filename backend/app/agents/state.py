@@ -1,66 +1,44 @@
-"""TenderState — the shared LangGraph state (PRD §5.3).
-
-Only the fields consumed by the Ingestor node are populated for REQ-001.
-The rest (risk_findings, feasibility_*, financial_summary, hitl_*, final_report)
-are stubbed with None/empty defaults and will be owned by their respective
-nodes in Week 2 (agent-designer skill: each field has exactly one writer).
-
-Lists written from parallel branches MUST carry a reducer so the last branch
-to finish doesn't clobber the others. For REQ-001 the Ingestor runs alone, so
-reducer-annotated lists are forward-compat declarations, not active fan-out.
-"""
+"""Shared LangGraph state schema for the TenderIQ analysis pipeline (REQ-003)."""
 from __future__ import annotations
 
-import operator
-from typing import Annotated, TypedDict
-
-
-class ChunkRef(TypedDict):
-    """A reference to a persisted chunk (id + provenance), NOT the raw text.
-
-    TenderState carries chunk *references*, never raw chunk text. Storing prose
-    in the checkpoint store leaks commercially sensitive tender content into an
-    audit log and bloats the checkpoint (ai-security T5). Agents that need the
-    text re-fetch it by id from tender_chunks, tenant-scoped.
-    """
-
-    chunk_id: str
-    page_number: int | None
-    detected_language: str
+from typing import TypedDict
 
 
 class TenderState(TypedDict):
+    """All nodes communicate exclusively through this TypedDict.
+
+    Fields are final for REQ-003 Slice 1 — do not add, remove, or rename.
+    """
+
+    # Identity
     tender_id: str
-    run_id: str | None
-    # Ingestor-owned: lightweight references to persisted chunks.
-    chunks: list[ChunkRef]
-    # Languages detected in the PDF (subset of ["ar", "en"]).
-    source_languages: Annotated[list[str], operator.add]
+    run_id: str
+    company_id: str
 
-    # ---- Week 2 stubs (owned by their respective nodes) ----
-    risk_findings: Annotated[list[dict], operator.add]  # risk_radar (parallel-safe)
-    feasibility_score: float | None                     # scorer
-    feasibility_breakdown: dict | None                  # scorer
-    financial_summary: dict | None                      # financial
-    hitl_approved: bool                                 # HITL gate
-    hitl_override_score: float | None                   # override endpoint
-    final_report: str | None                            # report_assembler
-    token_usage: Annotated[list[dict], operator.add]    # cost callback
+    # Ingestor output (populated before the graph starts)
+    chunks: list[dict]  # {content, detected_language, chunk_index}
 
+    # Supervisor
+    supervisor_ready: bool
 
-def initial_state(tender_id: str) -> TenderState:
-    """Fresh state for a new ingestion run."""
-    return TenderState(
-        tender_id=tender_id,
-        run_id=None,
-        chunks=[],
-        source_languages=[],
-        risk_findings=[],
-        feasibility_score=None,
-        feasibility_breakdown=None,
-        financial_summary=None,
-        hitl_approved=False,
-        hitl_override_score=None,
-        final_report=None,
-        token_usage=[],
-    )
+    # Specialist node outputs (stubbed in Slice 1, replaced by real agents later)
+    risk_findings: list[dict]
+    feasibility_score: float | None
+    feasibility_breakdown: dict | None
+    financial_summary: dict | None
+
+    # Aggregator
+    aggregated_results: dict | None
+
+    # HITL gate (REQ-007)
+    hitl_approved: bool
+    hitl_override_score: float | None
+
+    # Report (REQ-008)
+    final_report: str | None
+
+    # Cost tracking
+    token_usage: list[dict]  # accumulates per node
+
+    # Languages detected across tender chunks
+    source_languages: list[str]

@@ -10,7 +10,7 @@ Design (per senior-qa skill):
 """
 from __future__ import annotations
 
-import asyncio
+import os
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from langchain_core.exceptions import OutputParserException
 from sqlalchemy import event
 from sqlalchemy.pool import NullPool
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -25,6 +26,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 # `fakeredis` provides an in-process async Redis for deterministic rate-limit tests.
 import fakeredis.aioredis
 
+# Register custom markers
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: tests that take longer than a few seconds (e.g. heartbeat)")
+
+from app.agents.skills.feasibility_scoring import (
+    DimensionScore,
+    FeasibilityOutput,
+    SCOPE_ANCHOR_QUERIES,
+)
+from app.agents.skills.risk_clause_extraction import RiskFinding, RiskRadarOutput
 from app.config import get_settings
 from app.db import models  # noqa: F401  (register metadata)
 from app.db.base import Base
@@ -32,14 +43,18 @@ from app.db.session import get_session
 from app.main import create_app
 from app.middleware import rate_limit as rate_limit_module
 from app.middleware.auth import _hash_key
-from app.db.models import Company
+from app.db.models import Company, CompanyProfile, Tender, TenderChunk
 
 settings = get_settings()
+
+# Allow CI/dev to point tests at a dedicated test database without touching
+# the running dev database (REQ-002 QA slice).
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", settings.database_url)
 
 # A separate engine+sessionmaker bound to the test connection so we can wrap
 # every test in a single rollback. Tests must not see each other's writes.
 _test_engine = create_async_engine(
-    settings.database_url,
+    TEST_DATABASE_URL,
     pool_pre_ping=True,
     # NullPool: never reuse connections across event loops. pytest-asyncio
     # uses a fresh loop per test by default; a shared pool would hand a test
@@ -51,14 +66,6 @@ _test_engine = create_async_engine(
 _TestSessionLocal = async_sessionmaker(
     bind=_test_engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
 )
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    """Single event loop for the whole session — pytest-asyncio default is per-test."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
@@ -74,6 +81,28 @@ async def _create_schema() -> AsyncIterator[None]:
     async with _test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
     await _test_engine.dispose()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_checkpointer() -> None:
+    """Clear the graph checkpointer's pool + saver before each test.
+
+    ``_ensure_saver`` (:file:`app/agents/graph.py`) lazily creates a psycopg
+    ``AsyncConnectionPool`` bound to the current event loop.  pytest-asyncio
+    uses a fresh event loop per test function by default; if the checkpointer
+    still holds a pool from a prior loop, ``_ensure_saver`` will try to close
+    it via ``await self._pool.close()`` — but that pool's connections belong
+    to the **old** (closed) loop, producing ``CancelledError``.
+
+    We set both ``_pool`` and ``_saver`` to ``None`` before each test so that
+    ``_ensure_saver`` skips the close step and creates a fresh pool in the
+    current test's loop.  The old pool is garbage-collected along with its
+    dead event loop — no need for explicit teardown.
+    """
+    from app.agents.graph import graph
+
+    graph.checkpointer._pool = None
+    graph.checkpointer._saver = None
 
 
 @pytest_asyncio.fixture
@@ -359,4 +388,1602 @@ async def stub_embeddings(monkeypatch):
     # `run_ingestion` -> `ingest_tender`).
     monkeypatch.setattr(ingestor_module, "get_embeddings_client", lambda: stub)
     return stub
+
+
+# ---- REQ-002 company-profile fixtures ---------------------------------------
+
+@pytest_asyncio.fixture
+async def async_client(app_client: AsyncClient) -> AsyncIterator[AsyncClient]:
+    """Alias for app_client matching the REQ-002 QA slice naming."""
+    yield app_client
+
+
+@pytest_asyncio.fixture
+async def company_api_key(company_a: tuple[Company, str]) -> str:
+    """Raw API key for the primary test tenant."""
+    return company_a[1]
+
+
+@pytest_asyncio.fixture
+async def second_company_api_key(company_b: tuple[Company, str]) -> str:
+    """Raw API key for a second test tenant (cross-tenant isolation)."""
+    return company_b[1]
+
+
+@pytest_asyncio.fixture
+async def clean_profile(
+    db: AsyncSession, company_a: tuple[Company, str]
+) -> AsyncIterator[None]:
+    """Delete any profile for the primary test tenant before and after a test."""
+    from sqlalchemy import delete
+
+    company_id = company_a[0].id
+
+    async def _delete() -> None:
+        await db.execute(
+            delete(CompanyProfile).where(CompanyProfile.company_id == company_id)
+        )
+        await db.commit()
+
+    await _delete()
+    yield
+    await _delete()
+
+
+@pytest_asyncio.fixture
+async def profile_lookup_session(
+    db: AsyncSession, monkeypatch: Any
+) -> AsyncIterator[None]:
+    """Route profile_lookup's SessionLocal through the test transaction."""
+    import importlib
+    from contextlib import asynccontextmanager
+
+    profile_lookup_module = importlib.import_module("app.agents.tools.profile_lookup")
+
+    @asynccontextmanager
+    async def _test_session() -> AsyncIterator[AsyncSession]:
+        yield db
+
+    monkeypatch.setattr(profile_lookup_module, "SessionLocal", _test_session)
+    yield
+
+
+# ---- REQ-003 analysis-run fixtures ------------------------------------------
+
+EMBEDDING_STUB = [0.01] * get_settings().embedding_dimensions
+
+
+@pytest_asyncio.fixture
+async def ready_tender(db: AsyncSession, company_a: tuple[Company, str]) -> Tender:
+    """Tender with status='ready' and 3 tender_chunks rows."""
+    company, _ = company_a
+    tender = Tender(
+        id=str(uuid.uuid4()),
+        company_id=company.id,
+        filename="analysis_test.pdf",
+        storage_path="/tmp/analysis_test.pdf",
+        file_size_bytes=100,
+        status="ready",
+    )
+    db.add(tender)
+    await db.flush()
+
+    for i in range(3):
+        chunk = TenderChunk(
+            id=str(uuid.uuid4()),
+            tender_id=tender.id,
+            company_id=company.id,
+            chunk_index=i,
+            content=f"Chunk {i} content for analysis testing.",
+            detected_language="en",
+            embedding=EMBEDDING_STUB,
+        )
+        db.add(chunk)
+    await db.flush()
+    return tender
+
+
+@pytest_asyncio.fixture
+async def company_with_profile(
+    db: AsyncSession, company_a: tuple[Company, str]
+) -> tuple[Company, str]:
+    """company_a augmented with a valid CompanyProfile row."""
+    company, raw_key = company_a
+    profile = CompanyProfile(
+        company_id=company.id,
+        specializations=["civil"],
+        financial_capacity={
+            "currency": "SAR",
+            "annual_turnover": 1_000_000,
+            "available_bonding_capacity": 500_000,
+        },
+        geographic_reach=["SA"],
+        past_projects=[],
+        max_project_value=500_000,
+    )
+    db.add(profile)
+    await db.flush()
+    return company_a
+
+
+@pytest_asyncio.fixture
+async def company_without_profile(db: AsyncSession) -> tuple[Company, str]:
+    """Company with NO CompanyProfile (failure-path test)."""
+    return await create_company(db, name="No Profile Co")
+
+
+@pytest_asyncio.fixture
+async def graph_session(db: AsyncSession, monkeypatch: Any) -> None:
+    """Route run_graph's with_session() through the per-test transaction.
+
+    The POST /analyse endpoint schedules run_graph as a BackgroundTask, which
+    opens its own database session via ``with_session()`` from
+    ``app.db.session``. Without this patch, that session would use the
+    production engine — writes would leak outside the test transaction and
+    persist across tests.
+
+    We patch the module-level reference that tenders.py imported at load time
+    so that ``run_graph`` uses the same per-test ``db`` session, keeping all
+    writes inside the savepoint-based rollback boundary.
+    """
+    from app.routers import tenders as tenders_router
+
+    class _GraphSessionCtx:
+        async def __aenter__(self) -> AsyncSession:
+            return db
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(tenders_router, "with_session", lambda: _GraphSessionCtx())
+    yield
+
+
+# ---- REQ-004 Risk Radar fixtures --------------------------------------------
+
+class _MockStructuredLLM:
+    """Mock structured-output LLM that returns a canned RiskRadarOutput or raises.
+
+    Tracks call_count so tests can verify retry behaviour without inspecting
+    log output or timing.
+    """
+
+    def __init__(
+        self,
+        return_value: RiskRadarOutput | None = None,
+        raise_exc: BaseException | None = None,
+    ) -> None:
+        self._return_value = return_value
+        self._raise_exc = raise_exc
+        self.call_count = 0
+
+    async def ainvoke(self, messages: list, config: dict | None = None, **kwargs: Any) -> Any:
+        self.call_count += 1
+        if self._raise_exc:
+            raise self._raise_exc
+        return self._return_value
+
+
+@pytest.fixture
+def sample_chunks() -> list[dict]:
+    """5 realistic chunk dicts matching the Ingestor output shape (REQ-004).
+
+    Includes one Arabic chunk so bilingual-dedup tests have a realistic source.
+    """
+    return [
+        {
+            "content": (
+                "The Contractor shall pay liquidated damages for delay in completion "
+                "at the rate of 0.1% of the Contract Price per day, up to a maximum "
+                "of 10% of the Contract Price."
+            ),
+            "detected_language": "en",
+            "chunk_index": 0,
+        },
+        {
+            "content": (
+                "The Performance Security shall be in the amount of 10% of the "
+                "Contract Price and shall be issued by a bank acceptable to the "
+                "Employer. The security shall remain valid until the issue of the "
+                "Taking-Over Certificate."
+            ),
+            "detected_language": "en",
+            "chunk_index": 1,
+        },
+        {
+            "content": (
+                "The Employer may terminate the Contract if the Contractor "
+                "subcontracts the whole of the Works without prior approval, "
+                "or becomes bankrupt or insolvent. Termination shall take effect "
+                "upon receipt of the notice."
+            ),
+            "detected_language": "en",
+            "chunk_index": 2,
+        },
+        {
+            "content": (
+                "يجب على المقاول تقديم خطاب ضمان حسن التنفيذ بنسبة 5% من قيمة العقد "
+                "ويكون ساري المفعول حتى تاريخ إصدار شهادة الاستلام الابتدائي"
+            ),
+            "detected_language": "ar",
+            "chunk_index": 3,
+        },
+        {
+            "content": (
+                "Any dispute arising out of or in connection with the Contract "
+                "shall be referred to arbitration in accordance with the Rules of "
+                "Arbitration of the International Chamber of Commerce."
+            ),
+            "detected_language": "en",
+            "chunk_index": 4,
+        },
+    ]
+
+
+@pytest_asyncio.fixture
+async def mock_llm(monkeypatch: Any) -> _MockStructuredLLM:
+    """Fixture: patches risk_radar._build_llm to return a canned valid output.
+
+    The mock returns two findings with all required fields populated.
+    """
+    findings = RiskRadarOutput(findings=[
+        RiskFinding(
+            category="penalty",
+            severity="high",
+            clause_text="0.1% of the Contract Price per day, up to a maximum of 10%",
+            explanation="Standard delay penalty within typical range",
+            source_chunk_index=0,
+            confidence=0.92,
+        ),
+        RiskFinding(
+            category="fidic",
+            severity="critical",
+            clause_text="The Employer may terminate the Contract if the Contractor subcontracts the whole of the Works without prior approval",
+            explanation="Uncapped termination right with no cure period",
+            source_chunk_index=2,
+            confidence=0.88,
+        ),
+    ])
+    mock = _MockStructuredLLM(return_value=findings)
+    monkeypatch.setattr("app.agents.nodes.risk_radar._build_llm", lambda: mock)
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_llm_malformed(monkeypatch: Any) -> _MockStructuredLLM:
+    """Fixture: patches risk_radar._build_llm to always fail schema validation."""
+    mock = _MockStructuredLLM(
+        raise_exc=OutputParserException("Failed to parse LLM output as RiskRadarOutput")
+    )
+    monkeypatch.setattr("app.agents.nodes.risk_radar._build_llm", lambda: mock)
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_llm_api_error(monkeypatch: Any) -> _MockStructuredLLM:
+    """Fixture: patches risk_radar._build_llm to raise API errors on every call."""
+    mock = _MockStructuredLLM(raise_exc=Exception("Simulated API connection error"))
+    monkeypatch.setattr("app.agents.nodes.risk_radar._build_llm", lambda: mock)
+    return mock
+
+
+# ---- REQ-005 Feasibility Scorer fixtures -----------------------------------
+
+class _MockFeasibilityLLM:
+    """Mock structured-output LLM that returns a canned FeasibilityOutput or raises.
+
+    Tracks call_count so tests can verify retry behaviour without inspecting
+    log output or timing. Mirrors the _MockStructuredLLM pattern used for
+    risk_radar (REQ-004).
+    """
+
+    def __init__(
+        self,
+        return_value: FeasibilityOutput | None = None,
+        raise_exc: BaseException | None = None,
+    ) -> None:
+        self._return_value = return_value
+        self._raise_exc = raise_exc
+        self.call_count = 0
+
+    async def ainvoke(
+        self, messages: list, config: dict | None = None, **kwargs: Any
+    ) -> Any:
+        self.call_count += 1
+        if self._raise_exc:
+            raise self._raise_exc
+        return self._return_value
+
+
+@pytest_asyncio.fixture
+async def mock_feasibility_llm(monkeypatch: Any) -> _MockFeasibilityLLM:
+    """Fixture: patches feasibility_scorer._build_llm to return a FeasibilityOutput.
+
+    Uses varied scores including one above 20 (timeline=25) and one below 0
+    (geographic_scope=-3) to test clamping.  Uses model_construct to bypass
+    Pydantic field-level validation for the out-of-range values.
+    """
+    output = FeasibilityOutput.model_construct(**{
+        "technical_fit": DimensionScore.model_construct(
+            score=18,
+            rationale="Company specialisations of civil and roads cover the tender scope of highway construction.",
+        ),
+        "financial_capacity": DimensionScore.model_construct(
+            score=14,
+            rationale="Tender value is within company max_project_value and bonding capacity is adequate.",
+        ),
+        "timeline": DimensionScore.model_construct(
+            score=25,
+            rationale="Tender duration of 24 months is well within the company's demonstrated capability.",
+        ),
+        "geographic_scope": DimensionScore.model_construct(
+            score=-3,
+            rationale="Tender location in SA matches company geographic_reach of SA.",
+        ),
+        "past_experience": DimensionScore.model_construct(
+            score=12,
+            rationale="Company has 2 past_projects in roads and civil sectors covering similar scope.",
+        ),
+    })
+    mock = _MockFeasibilityLLM(return_value=output)
+    monkeypatch.setattr(
+        "app.agents.nodes.feasibility_scorer._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_feasibility_llm_malformed(
+    monkeypatch: Any,
+) -> _MockFeasibilityLLM:
+    """Fixture: patches feasibility_scorer._build_llm to fail schema validation."""
+    mock = _MockFeasibilityLLM(
+        raise_exc=OutputParserException(
+            "Failed to parse LLM output as FeasibilityOutput"
+        )
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.feasibility_scorer._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_feasibility_llm_api_error(
+    monkeypatch: Any,
+) -> _MockFeasibilityLLM:
+    """Fixture: patches feasibility_scorer._build_llm to raise API errors."""
+    mock = _MockFeasibilityLLM(
+        raise_exc=Exception("Simulated API connection error")
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.feasibility_scorer._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def company_profile_fixture(
+    db: AsyncSession, company_a: tuple[Company, str]
+) -> tuple[Company, str]:
+    """Company with a fully populated profile (all 6 fields of CompanyProfileSchema).
+
+    Includes non-empty past_projects and all financial_capacity sub-fields
+    so the feasibility scorer can score all 5 dimensions (REQ-005 Slice 5).
+    """
+    company, raw_key = company_a
+    profile = CompanyProfile(
+        company_id=company.id,
+        specializations=["civil", "roads"],
+        financial_capacity={
+            "currency": "SAR",
+            "annual_turnover": 1_000_000,
+            "available_bonding_capacity": 500_000,
+        },
+        geographic_reach=["SA"],
+        past_projects=[
+            {
+                "name": "Road Project Alpha",
+                "value": 300_000,
+                "year": 2024,
+                "sector": "roads",
+            },
+            {
+                "name": "Civil Works Beta",
+                "value": 200_000,
+                "year": 2023,
+                "sector": "civil",
+            },
+        ],
+        max_project_value=500_000,
+    )
+    db.add(profile)
+    await db.flush()
+    return company, raw_key
+
+
+@pytest.fixture
+def sample_scope_chunks() -> list[dict]:
+    """5 chunk dicts covering project scope, value, timeline, location, qualifications.
+
+    Matches the SCOPE_ANCHOR_QUERIES structure from feasibility_scoring.py
+    (project description, contract value, timeline, location, qualifications).
+    """
+    return [
+        {
+            "content": (
+                "The project involves the construction of a 15km highway connecting "
+                "the industrial zone to the main port. Scope includes earthworks, "
+                "paving, drainage systems, and lighting."
+            ),
+            "detected_language": "en",
+            "chunk_index": 0,
+        },
+        {
+            "content": (
+                "The estimated contract value is SAR 45,000,000. The Employer will "
+                "require a performance bond of 10% of the contract value upon award."
+            ),
+            "detected_language": "en",
+            "chunk_index": 1,
+        },
+        {
+            "content": (
+                "The project duration is 24 months from the date of commencement. "
+                "Expected completion date is December 2027. An early completion "
+                "bonus of SAR 500,000 is available."
+            ),
+            "detected_language": "en",
+            "chunk_index": 2,
+        },
+        {
+            "content": (
+                "The project is located in the Eastern Province of Saudi Arabia, "
+                "approximately 50km from Dammam. Site access will be provided "
+                "by the Employer."
+            ),
+            "detected_language": "en",
+            "chunk_index": 3,
+        },
+        {
+            "content": (
+                "Contractors must have at least 10 years of experience in highway "
+                "construction, a valid SAGMA classification in roadworks Grade A, "
+                "and must have completed at least two projects of similar value "
+                "in the GCC region."
+            ),
+            "detected_language": "en",
+            "chunk_index": 4,
+        },
+    ]
+
+
+# ---- REQ-006 Financial Analyst fixtures -------------------------------------
+
+
+class _MockFinancialLLM:
+    """Mock structured-output LLM that returns a canned FinancialOutput or raises.
+
+    Tracks call_count so tests can verify retry behaviour without inspecting
+    log output or timing. Mirrors the _MockStructuredLLM pattern used for
+    risk_radar (REQ-004) and _MockFeasibilityLLM (REQ-005).
+    """
+
+    def __init__(
+        self,
+        return_value: Any | None = None,
+        raise_exc: BaseException | None = None,
+    ) -> None:
+        self._return_value = return_value
+        self._raise_exc = raise_exc
+        self.call_count = 0
+
+    async def ainvoke(
+        self, messages: list, config: dict | None = None, **kwargs: Any
+    ) -> Any:
+        self.call_count += 1
+        if self._raise_exc:
+            raise self._raise_exc
+        return self._return_value
+
+
+@pytest_asyncio.fixture
+async def mock_financial_llm(monkeypatch: Any) -> _MockFinancialLLM:
+    """Fixture: patches financial_analyst._build_llm to return a valid FinancialOutput.
+    Contains all fields populated with the spec's canonical values.
+    """
+    from app.agents.skills.financial_extraction import (
+        BondRequirement,
+        FinancialOutput,
+        LiquidatedDamages,
+        MonetaryValue,
+        PaymentMilestone,
+    )
+
+    output = FinancialOutput(
+        contract_value=MonetaryValue(
+            value=35_000_000.0, currency="SAR", needs_review=False,
+        ),
+        bonds=[
+            BondRequirement(
+                bond_type="performance",
+                amount=MonetaryValue(
+                    value=3_500_000.0, currency="SAR", needs_review=False,
+                ),
+                percentage=10.0,
+                conditions=(
+                    "Unconditional bank guarantee valid until issuance "
+                    "of the Performance Certificate."
+                ),
+                source_chunk_index=0,
+            ),
+            BondRequirement(
+                bond_type="advance_payment",
+                amount=MonetaryValue(
+                    value=5_250_000.0, currency="SAR", needs_review=False,
+                ),
+                percentage=15.0,
+                conditions="Advance Payment Guarantee, 15% of contract value.",
+                source_chunk_index=1,
+            ),
+        ],
+        liquidated_damages=LiquidatedDamages(
+            rate=MonetaryValue(
+                value=5_000.0, currency="SAR", needs_review=False,
+            ),
+            period="per day",
+            cap=MonetaryValue(
+                value=3_500_000.0, currency="SAR", needs_review=False,
+            ),
+            cap_percentage=10.0,
+            source_chunk_index=2,
+        ),
+        payment_schedule=[
+            PaymentMilestone(
+                description="Advance mobilisation payment",
+                percentage=20.0,
+                amount=None,
+                trigger="on signing of Contract Agreement",
+            ),
+            PaymentMilestone(
+                description="Completion of works",
+                percentage=50.0,
+                amount=None,
+                trigger="on completion of all works",
+            ),
+            PaymentMilestone(
+                description="Final payment on taking-over certificate",
+                percentage=30.0,
+                amount=None,
+                trigger="on issuance of Taking-Over Certificate",
+            ),
+        ],
+        retention_rate=5.0,
+        advance_payment=MonetaryValue(
+            value=5_250_000.0, currency="SAR", needs_review=False,
+        ),
+    )
+    mock = _MockFinancialLLM(return_value=output)
+    monkeypatch.setattr(
+        "app.agents.nodes.financial_analyst._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_financial_llm_invalid_currency(
+    monkeypatch: Any,
+) -> _MockFinancialLLM:
+    """Fixture: returns a FinancialOutput with invalid currency codes.
+    contract_value.currency = "Riyals" (mapped via CURRENCY_NORMALISATION)
+    bonds[1].amount.currency = "INVALID_CURR" (-> UNKNOWN / needs_review=True)
+    """
+    from app.agents.skills.financial_extraction import (
+        BondRequirement,
+        FinancialOutput,
+        MonetaryValue,
+    )
+
+    output = FinancialOutput(
+        contract_value=MonetaryValue(
+            value=35_000_000.0, currency="Riyals", needs_review=False,
+        ),
+        bonds=[
+            BondRequirement(
+                bond_type="performance",
+                amount=MonetaryValue(
+                    value=3_500_000.0, currency="SAR", needs_review=False,
+                ),
+                percentage=10.0,
+                conditions="Performance bond.",
+                source_chunk_index=0,
+            ),
+            BondRequirement(
+                bond_type="advance_payment",
+                amount=MonetaryValue(
+                    value=5_250_000.0, currency="INVALID_CURR", needs_review=False,
+                ),
+                percentage=15.0,
+                conditions="Advance payment guarantee.",
+                source_chunk_index=1,
+            ),
+        ],
+        liquidated_damages=None,
+        payment_schedule=[],
+        retention_rate=None,
+        advance_payment=None,
+    )
+    mock = _MockFinancialLLM(return_value=output)
+    monkeypatch.setattr(
+        "app.agents.nodes.financial_analyst._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_financial_llm_malformed(
+    monkeypatch: Any,
+) -> _MockFinancialLLM:
+    """Fixture: patches financial_analyst._build_llm to fail schema validation."""
+    mock = _MockFinancialLLM(
+        raise_exc=OutputParserException(
+            "Failed to parse LLM output as FinancialOutput"
+        )
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.financial_analyst._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_financial_llm_api_error(
+    monkeypatch: Any,
+) -> _MockFinancialLLM:
+    """Fixture: patches financial_analyst._build_llm to raise API errors."""
+    mock = _MockFinancialLLM(
+        raise_exc=Exception("Simulated API connection error")
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.financial_analyst._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_financial_llm_bilingual_duplicate(
+    monkeypatch: Any,
+) -> _MockFinancialLLM:
+    """Fixture: returns a FinancialOutput with TWO performance bond entries.
+    Simulates pre-dedup state from Arabic + English chunks.
+    """
+    from app.agents.skills.financial_extraction import (
+        BondRequirement,
+        FinancialOutput,
+        MonetaryValue,
+    )
+
+    output = FinancialOutput(
+        contract_value=MonetaryValue(
+            value=35_000_000.0, currency="ريال سعودي", needs_review=False,
+        ),
+        bonds=[
+            BondRequirement(
+                bond_type="performance",
+                amount=MonetaryValue(
+                    value=3_500_000.0, currency="ريال سعودي", needs_review=False,
+                ),
+                percentage=10.0,
+                conditions="خطاب ضمان حسن التنفيذ بنسبة 10% من قيمة العقد",
+                source_chunk_index=0,
+            ),
+            BondRequirement(
+                bond_type="performance",
+                amount=MonetaryValue(
+                    value=3_500_000.0, currency="SAR", needs_review=False,
+                ),
+                percentage=10.0,
+                conditions="Performance bond of 10% of contract value.",
+                source_chunk_index=1,
+            ),
+        ],
+        liquidated_damages=None,
+        payment_schedule=[],
+        retention_rate=None,
+        advance_payment=None,
+    )
+    mock = _MockFinancialLLM(return_value=output)
+    monkeypatch.setattr(
+        "app.agents.nodes.financial_analyst._build_llm", lambda: mock
+    )
+    return mock
+
+
+# ---- REQ-008 Report Assembler fixtures -------------------------------------
+
+
+def _build_faithful_output(messages: list) -> Any:
+    """Build a ``ReportOutput`` that matches the context instructions.
+
+    Parses ``effective_score``, ``go_no_go``, and ``is_analyst_override``
+    from the final ``HumanMessage`` rendered by ``_format_report_context``
+    so the mock is "faithful" to what the node tells the LLM.
+    """
+    import re
+
+    from app.agents.skills.report_synthesis import GoNoGo, ReportOutput
+
+    effective_score = 82.0
+    go_no_go = "GO"
+    is_analyst_override = False
+    ai_score = None
+
+    for msg in messages:
+        if not hasattr(msg, "content") or not isinstance(msg.content, str):
+            continue
+        content: str = msg.content
+
+        m = re.search(
+            r"## Effective Feasibility Score\n\s*([\d.]+)", content
+        )
+        if m:
+            effective_score = float(m.group(1))
+
+        m = re.search(
+            r"## Go/No-Go Recommendation[^#]*\n\s*(GO|REVIEW|DECLINE)",
+            content,
+        )
+        if m:
+            go_no_go = m.group(1)
+
+        m = re.search(r"## Is Analyst Override\n\s*(True|False)", content)
+        if m:
+            is_analyst_override = m.group(1) == "True"
+
+        m = re.search(r"ai_score\):\s*([\d.]+)", content)
+        if m:
+            ai_score = float(m.group(1))
+
+    # Determine risk count from the "Top N Risks" header
+    risk_count = 0
+    for msg in messages:
+        if not hasattr(msg, "content") or not isinstance(msg.content, str):
+            continue
+        m = re.search(r"## Top (\d+) Risks", msg.content)
+        if m:
+            risk_count = int(m.group(1))
+            break
+
+    if risk_count < 1:
+        risk_count = 2
+
+    return _make_report_output(
+        go_no_go=go_no_go,
+        effective_score=effective_score,
+        is_analyst_override=is_analyst_override,
+        analyst_note=(
+            "Feasibility score adjusted by analyst review."
+            if is_analyst_override
+            else None
+        ),
+        risk_count=risk_count,
+    )
+
+
+class _MockReportLLM:
+    """Mock structured-output LLM for report_assembler (REQ-008).
+
+    When ``return_value`` is provided returns it verbatim (canned
+    responses for override/error tests).  When ``return_value`` is
+    ``None`` (default) it parses the context from the input messages
+    and builds a *faithful* ``ReportOutput`` — the mock "follows
+    instructions" just as a well-behaved LLM should.
+
+    Tracks ``call_count`` so tests can verify retry behaviour without
+    inspecting log output or timing.  Fires any ``on_llm_end`` callbacks
+    in ``config`` so the ``CostTrackingHandler`` writes a cost event —
+    matching the pattern expected by ``_build_callback_config``.
+
+    Mirrors the ``_MockStructuredLLM`` / ``_MockFeasibilityLLM`` /
+    ``_MockFinancialLLM`` pattern used for REQ-004/005/006.
+    """
+
+    def __init__(
+        self,
+        return_value: Any | None = None,
+        raise_exc: BaseException | None = None,
+    ) -> None:
+        self._return_value = return_value
+        self._raise_exc = raise_exc
+        self.call_count = 0
+
+    async def ainvoke(
+        self, messages: list, config: dict | None = None, **kwargs: Any
+    ) -> Any:
+        self.call_count += 1
+
+        # Fire callbacks BEFORE the raise check so schema-validation
+        # retries still trigger CostTrackingHandler (on_llm_end fires
+        # after the raw LLM call succeeds, even if structured-output
+        # parsing fails).  Arrange the exception AFTER callbacks so the
+        # cost-tracker actually writes the row for the attempt.
+        if config:
+            from langchain_core.outputs import Generation, LLMResult
+
+            handlers = config.get("callbacks", [])
+            if handlers:
+                llm_result = LLMResult(
+                    generations=[[Generation(text="mock")]],
+                    llm_output={
+                        "model_name": "gemini-2.5-flash",
+                        "token_usage": {
+                            "prompt_tokens": 100,
+                            "completion_tokens": 50,
+                        },
+                    },
+                )
+                for h in handlers:
+                    if hasattr(h, "on_llm_end"):
+                        await h.on_llm_end(llm_result)
+
+        if self._raise_exc:
+            raise self._raise_exc
+
+        # Build faithful output when no canned return_value is set.
+        output = (
+            self._return_value
+            if self._return_value is not None
+            else _build_faithful_output(messages)
+        )
+
+        return output
+
+
+def _make_report_output(
+    go_no_go: str = "GO",
+    effective_score: float = 82.0,
+    is_analyst_override: bool = False,
+    analyst_note: str | None = None,
+    risk_count: int = 2,
+) -> Any:
+    """Build a ``ReportOutput`` with the given overrides.
+
+    Returns a properly constructed Pydantic object.  Used by multiple
+    fixtures below so the canned values stay in one place.
+    """
+    from app.agents.skills.report_synthesis import (
+        GoNoGo,
+        ReportOutput,
+        RiskSummaryItem,
+    )
+
+    risks = [
+        RiskSummaryItem(
+            category="fidic",
+            severity="high",
+            description="Standard delay damages clause with 10% cap.",
+        ),
+        RiskSummaryItem(
+            category="lg_bond",
+            severity="medium",
+            description="Standard 5% performance bond requirement.",
+        ),
+    ]
+    if risk_count == 7:
+        risks = risks * 3 + [risks[0]]  # 7 items total
+        risks = risks[:7]
+
+    return ReportOutput(
+        go_no_go=GoNoGo(go_no_go),
+        effective_score=effective_score,
+        is_analyst_override=is_analyst_override,
+        executive_summary=(
+            "This tender covers road construction in Egypt with a contract "
+            "value of EGP 35M and a duration of 24 months. The overall "
+            "recommendation is GO with a feasibility score of 82 out of 100. "
+            "Two risk findings were identified in the medium range. The "
+            "financial profile is comfortable and within company capacity."
+        ),
+        recommendation=(
+            "We recommend proceeding with a bid for this tender."
+        ),
+        risk_summary=risks[:risk_count],
+        feasibility_highlights=[
+            "Technical Fit: 18/20 — strong alignment with company specialisations.",
+            "Financial Capacity: 16/20 — adequate bonding capacity.",
+            "Geographic Scope: 20/20 — perfect geographic fit.",
+        ],
+        financial_highlights=[
+            "Contract value: EGP 35,000,000.",
+            "Performance bond: 5% of contract value.",
+            "LD cap at 10% of contract value.",
+        ],
+        analyst_note=analyst_note,
+    )
+
+
+@pytest_asyncio.fixture
+async def mock_report_llm(monkeypatch: Any) -> _MockReportLLM:
+    """Fixture: patches report_assembler._build_llm with a faithful mock.
+
+    The mock parses the context from input messages and returns a
+    ``ReportOutput`` that matches (faithful LLM behaviour).  Tests
+    that need a specific canned return value can set
+    ``mock.call_count`` (read-only) or patch manually.
+    """
+    mock = _MockReportLLM()
+    monkeypatch.setattr(
+        "app.agents.nodes.report_assembler._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_report_llm_override(monkeypatch: Any) -> _MockReportLLM:
+    """Fixture: patches report_assembler._build_llm, is_analyst_override=True.
+
+    Returns:
+        go_no_go="REVIEW", effective_score=65.0, is_analyst_override=True,
+        analyst_note="Feasibility score adjusted from 35 to 65 by analyst review."
+    """
+    output = _make_report_output(
+        go_no_go="REVIEW",
+        effective_score=65.0,
+        is_analyst_override=True,
+        analyst_note=(
+            "Feasibility score adjusted from 35 to 65 by analyst review."
+        ),
+    )
+    mock = _MockReportLLM(return_value=output)
+    monkeypatch.setattr(
+        "app.agents.nodes.report_assembler._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_report_llm_malformed(monkeypatch: Any) -> _MockReportLLM:
+    """Fixture: patches report_assembler._build_llm to fail schema validation."""
+    mock = _MockReportLLM(
+        raise_exc=OutputParserException(
+            "Failed to parse LLM output as ReportOutput"
+        )
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.report_assembler._build_llm", lambda: mock
+    )
+    return mock
+
+
+@pytest_asyncio.fixture
+async def mock_report_llm_api_error(monkeypatch: Any) -> _MockReportLLM:
+    """Fixture: patches report_assembler._build_llm to raise API errors."""
+    mock = _MockReportLLM(
+        raise_exc=Exception("Simulated API connection error")
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.report_assembler._build_llm", lambda: mock
+    )
+    return mock
+
+
+# ---- REQ-007 HITL Override Gate fixtures -------------------------------
+
+
+@pytest_asyncio.fixture
+async def awaiting_hitl_run(
+    app_client,
+    db,
+    company_with_profile,
+    auth_headers,
+    mock_llm,
+    mock_feasibility_llm,
+    mock_financial_llm,
+    profile_lookup_session,
+    monkeypatch,
+) -> dict:
+    """Create a tender, run full analysis, and return when state='awaiting_hitl'.
+
+    The returned dict provides tender_id, run_id, company, and raw_key so each
+    test can POST /approve or /override without repeating the setup.
+
+    Depends on mock_llm fixtures so the graph runs without real API calls
+    (REQ-007 QA: never hit real LLM providers in CI).
+
+    The graph is run via its checkpointer directly (not through
+    ``run_graph``) so the test session is never contested.  The DB state
+    is updated manually after the graph reaches the HITL interrupt.
+    """
+    import asyncio
+    from uuid import uuid4
+
+    from app.db.models import AnalysisRun, Tender, TenderChunk
+    from sqlalchemy import func, update
+
+    company, raw_key = company_with_profile
+    EMBEDDING_STUB = [0.01] * get_settings().embedding_dimensions
+
+    # ── Mock embeddings ─────────────────────────────────────────────────────
+    # Every module that calls get_embeddings_client must be patched separately
+    # because Python's ``from ... import`` creates a local name binding that is
+    # invisible to a module-level monkeypatch of the source module.
+    class _MockEmbeddings:
+        def embed_documents(self, texts):
+            return [[0.01] * get_settings().embedding_dimensions for _ in texts]
+        def embed_query(self, text):
+            return [0.01] * get_settings().embedding_dimensions
+    monkeypatch.setattr("app.agents.retrieval.get_embeddings_client", lambda: _MockEmbeddings())
+    monkeypatch.setattr("app.agents.nodes.risk_radar.get_embeddings_client", lambda: _MockEmbeddings())
+
+    tender = Tender(
+        id=str(uuid4()),
+        company_id=company.id,
+        filename="hitl_test.pdf",
+        storage_path="/tmp/hitl_test.pdf",
+        file_size_bytes=100,
+        status="ready",
+    )
+    db.add(tender)
+    await db.flush()
+
+    for i in range(3):
+        chunk = TenderChunk(
+            id=str(uuid4()),
+            tender_id=tender.id,
+            company_id=company.id,
+            chunk_index=i,
+            content=f"HITL test chunk {i} content for analysis testing.",
+            detected_language="en",
+            embedding=EMBEDDING_STUB,
+        )
+        db.add(chunk)
+    await db.flush()
+
+    run = AnalysisRun(
+        id=str(uuid4()),
+        tender_id=tender.id,
+        company_id=company.id,
+        state="pending",
+    )
+    db.add(run)
+    await db.flush()
+    run_id = run.id
+    await db.commit()
+
+    chunks = [
+        {
+            "content": f"HITL test chunk {i} content for analysis testing.",
+            "detected_language": "en",
+            "chunk_index": i,
+        }
+        for i in range(3)
+    ]
+
+    from app.agents.graph import graph
+    from app.agents.state import TenderState
+
+    initial_state = TenderState(
+        tender_id=str(tender.id),
+        run_id=str(run_id),
+        company_id=str(company.id),
+        chunks=chunks,
+        supervisor_ready=False,
+        risk_findings=[],
+        feasibility_score=None,
+        feasibility_breakdown=None,
+        financial_summary=None,
+        aggregated_results=None,
+        hitl_approved=False,
+        hitl_override_score=None,
+        final_report=None,
+        token_usage=[],
+        source_languages=[],
+    )
+    config = {"configurable": {"thread_id": str(run_id)}}
+
+    saw_aggregator = False
+    async for event in graph.astream(initial_state, config):
+        node_name = list(event.keys())[0]
+        if node_name.startswith("__"):
+            continue
+        if node_name == "aggregator":
+            saw_aggregator = True
+
+    if saw_aggregator:
+        final_checkpoint = await graph.aget_state(config)
+        feasibility_score = final_checkpoint.values.get("feasibility_score") if final_checkpoint else None
+        findings = (final_checkpoint.values.get("risk_findings", []) or []) if final_checkpoint else []
+        financial_summary = (final_checkpoint.values.get("financial_summary", {}) or {}) if final_checkpoint else {}
+
+        if findings:
+            from sqlalchemy import insert
+            from app.db.models import RiskFinding
+            await db.execute(
+                insert(RiskFinding).values([
+                    {
+                        "run_id": run_id,
+                        "category": f["category"],
+                        "severity": f["severity"],
+                        "clause_text": f["clause_text"],
+                        "explanation": f["explanation"],
+                        "source_chunk_index": f["source_chunk_index"],
+                        "confidence": f["confidence"],
+                    }
+                    for f in findings
+                ])
+            )
+
+        if "error" not in financial_summary:
+            from app.routers.tenders import _flatten_financial_summary
+            commitment_rows = _flatten_financial_summary(financial_summary, run_id)
+            if commitment_rows:
+                from sqlalchemy import insert
+                from app.db.models import FinancialCommitment
+                await db.execute(
+                    insert(FinancialCommitment).values(commitment_rows)
+                )
+
+        await db.execute(
+            update(AnalysisRun)
+            .where(AnalysisRun.id == run_id)
+            .values(
+                state="awaiting_hitl",
+                feasibility_score=feasibility_score,
+                started_at=func.now(),
+            )
+        )
+        await db.commit()
+    else:
+        pytest.fail("Graph did not reach the aggregator — HITL gate not hit")
+
+    return {
+        "tender_id": tender.id,
+        "run_id": run_id,
+        "company": company,
+        "raw_key": raw_key,
+    }
+
+
+@pytest_asyncio.fixture
+async def mock_report_assembler(monkeypatch) -> None:
+    """Patch report_assembler_node to return immediately with a mock report.
+
+    Prevents real LLM calls during HITL tests even after REQ-008 wires in
+    the real Report Assembler (REQ-007 QA: never make real LLM calls in tests).
+
+    Patching the module-level function is sufficient because the compiled graph
+    was constructed with ``add_node("report_assembler", report_assembler_node)``
+    which stores a reference from the module-level name.  After REQ-008
+    replaces the stub, this fixture will need to also update the compiled
+    graph's internal node reference.
+    """
+    async def _mock(state, config):
+        state["final_report"] = "MOCK REPORT"
+        return state
+
+    monkeypatch.setattr(
+        "app.agents.nodes.report_assembler.report_assembler_node",
+        _mock,
+    )
+
+
+@pytest_asyncio.fixture
+async def second_company(company_b: tuple) -> str:
+    """Raw API key for a second tenant (cross-tenant authorisation tests).
+
+    Alias for ``second_company_api_key`` to match the naming in the REQ-007
+    QA slice spec.
+    """
+    return company_b[1]
+
+
+@pytest.fixture
+def sample_financial_chunks() -> list[dict]:
+    """6 chunk dicts covering bond requirements, payment terms, LD clauses,
+    and contract value (REQ-006 financial anchor topics).
+    """
+    return [
+        {
+            "content": (
+                "Section 4.2 - Performance Security. The Contractor shall provide "
+                "a Performance Security in the form of an unconditional bank "
+                "guarantee in the amount of 10% of the Accepted Contract Amount."
+            ),
+            "detected_language": "en",
+            "chunk_index": 0,
+        },
+        {
+            "content": (
+                "Section 14.2 - Advance Payment. The Employer shall make an "
+                "advance payment of 15% of the Accepted Contract Amount upon "
+                "submission of the Performance Security."
+            ),
+            "detected_language": "en",
+            "chunk_index": 1,
+        },
+        {
+            "content": (
+                "Section 8.7 - Delay Damages. The Contractor shall pay Delay "
+                "Damages at the rate of SAR 5,000 per day. The total amount "
+                "shall not exceed 10% of the Accepted Contract Amount."
+            ),
+            "detected_language": "en",
+            "chunk_index": 2,
+        },
+        {
+            "content": (
+                "Section 14.3 - Interim Payments. The Contractor shall submit "
+                "IPCs monthly. The Employer shall retain 5% of each IPC."
+            ),
+            "detected_language": "en",
+            "chunk_index": 3,
+        },
+        {
+            "content": (
+                "The Accepted Contract Amount is SAR 35,000,000. Payment shall "
+                "be made as follows: 20%% on signing, 50%% on completion, "
+                "30%% on taking-over certificate."
+            ),
+            "detected_language": "en",
+            "chunk_index": 4,
+        },
+        {
+            "content": (
+                "Section 14.2 - Advance Payment. The advance payment of "
+                "SAR 5,250,000 shall be repaid by deductions from each IPC "
+                "at a rate of 25%% of the amount of each IPC."
+            ),
+            "detected_language": "en",
+            "chunk_index": 5,
+        },
+    ]
+
+
+@pytest_asyncio.fixture
+async def complete_run_fixture(
+    app_client: Any,
+    db: AsyncSession,
+    company_with_profile: Any,
+    auth_headers: Any,
+    mock_llm: Any,
+    mock_feasibility_llm: Any,
+    mock_financial_llm: Any,
+    mock_report_llm: _MockReportLLM,
+    profile_lookup_session: None,
+    monkeypatch: Any,
+) -> dict:
+    """Create a tender + run that reaches ``state='complete'``.
+
+    Runs the full LangGraph pipeline (risk_radar → scorer → financial →
+    aggregator → HITL interrupt → resume with approval →
+    report_assembler) with mocked LLM nodes.  The returned dict provides
+    everything a test needs to make API calls:
+
+        tender_id, run_id, company, raw_key
+
+    The ``agent_trace`` on the ``AnalysisRun`` row contains the
+    ``report_assembler`` key so ``GET /tenders/{id}/report`` returns 200.
+
+    NOTE: patches ``report_assembler.with_session`` so the cost tracker
+    writes into the per-test transaction.
+    """
+    import asyncio
+    from uuid import uuid4
+
+    from app.agents.graph import graph
+    from app.agents.state import TenderState
+    from app.config import get_settings
+    from app.db.models import AnalysisRun, Tender, TenderChunk
+    from sqlalchemy import func, update
+
+    from app.routers.tenders import _flatten_financial_summary
+
+    company, raw_key = company_with_profile
+    EMBEDDING_STUB = [0.01] * get_settings().embedding_dimensions
+
+    # ── Mock embeddings ─────────────────────────────────────────────
+    class _MockEmbeddings:
+        def embed_documents(self, texts: list) -> list:
+            return [[0.01] * get_settings().embedding_dimensions for _ in texts]
+
+        def embed_query(self, text: str) -> list:
+            return [0.01] * get_settings().embedding_dimensions
+
+    monkeypatch.setattr(
+        "app.agents.retrieval.get_embeddings_client", lambda: _MockEmbeddings()
+    )
+    monkeypatch.setattr(
+        "app.agents.nodes.risk_radar.get_embeddings_client", lambda: _MockEmbeddings()
+    )
+
+    # ── Patch report_assembler.with_session to use test DB ──────────
+    class _TestSessionCtx:
+        async def __aenter__(self) -> Any:
+            return db
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        "app.agents.nodes.report_assembler.with_session",
+        lambda: _TestSessionCtx(),
+    )
+
+    # ── Create tender + chunks ──────────────────────────────────────
+    tender = Tender(
+        id=str(uuid4()),
+        company_id=company.id,
+        filename="complete_test.pdf",
+        storage_path="/tmp/complete_test.pdf",
+        file_size_bytes=100,
+        status="ready",
+    )
+    db.add(tender)
+    await db.flush()
+
+    for i in range(3):
+        chunk = TenderChunk(
+            id=str(uuid4()),
+            tender_id=tender.id,
+            company_id=company.id,
+            chunk_index=i,
+            content=f"Complete test chunk {i} content.",
+            detected_language="en",
+            embedding=EMBEDDING_STUB,
+        )
+        db.add(chunk)
+    await db.flush()
+
+    # ── Create analysis run ─────────────────────────────────────────
+    run = AnalysisRun(
+        id=str(uuid4()),
+        tender_id=tender.id,
+        company_id=company.id,
+        state="pending",
+    )
+    db.add(run)
+    await db.flush()
+    run_id = run.id
+    await db.commit()
+
+    chunks_for_state = [
+        {
+            "content": f"Complete test chunk {i} content.",
+            "detected_language": "en",
+            "chunk_index": i,
+        }
+        for i in range(3)
+    ]
+
+    # ── Run graph to aggregator (HITL interrupt) ────────────────────
+    initial_state = TenderState(
+        tender_id=str(tender.id),
+        run_id=str(run_id),
+        company_id=str(company.id),
+        chunks=chunks_for_state,
+        supervisor_ready=False,
+        risk_findings=[],
+        feasibility_score=None,
+        feasibility_breakdown=None,
+        financial_summary=None,
+        aggregated_results=None,
+        hitl_approved=False,
+        hitl_override_score=None,
+        final_report=None,
+        token_usage=[],
+        source_languages=[],
+    )
+    config = {"configurable": {"thread_id": str(run_id)}}
+
+    saw_aggregator = False
+    async for event in graph.astream(initial_state, config):
+        node_name = list(event.keys())[0]
+        if node_name.startswith("__"):
+            continue
+        if node_name == "aggregator":
+            saw_aggregator = True
+
+    if not saw_aggregator:
+        pytest.fail("Graph did not reach the aggregator — HITL gate not hit")
+
+    # ── Persist findings + financial commitments ────────────────────
+    final_checkpoint = await graph.aget_state(config)
+    findings = (
+        (final_checkpoint.values.get("risk_findings", []) or [])
+        if final_checkpoint else []
+    )
+    financial_summary = (
+        (final_checkpoint.values.get("financial_summary", {}) or {})
+        if final_checkpoint else {}
+    )
+
+    if findings:
+        from sqlalchemy import insert as sql_insert
+        from app.db.models import RiskFinding
+
+        await db.execute(
+            sql_insert(RiskFinding).values([
+                {
+                    "run_id": run_id,
+                    "category": f["category"],
+                    "severity": f["severity"],
+                    "clause_text": f["clause_text"],
+                    "explanation": f["explanation"],
+                    "source_chunk_index": f["source_chunk_index"],
+                    "confidence": f["confidence"],
+                }
+                for f in findings
+            ])
+        )
+
+    if "error" not in (financial_summary or {}):
+        commitment_rows = _flatten_financial_summary(financial_summary, run_id)
+        if commitment_rows:
+            from sqlalchemy import insert as sql_insert
+            from app.db.models import FinancialCommitment
+
+            await db.execute(
+                sql_insert(FinancialCommitment).values(commitment_rows)
+            )
+
+    await db.commit()
+
+    # ── Inject HITL approval and resume graph ───────────────────────
+    await graph.aupdate_state(config, {"hitl_approved": True})
+
+    async for event in graph.astream(None, config):
+        node_name = list(event.keys())[0]
+        if node_name.startswith("__"):
+            continue
+        await db.execute(
+            update(AnalysisRun)
+            .where(AnalysisRun.id == run_id)
+            .values(
+                agent_trace=AnalysisRun.agent_trace.concat(
+                    {node_name: event[node_name]}
+                )
+            )
+        )
+        await db.commit()
+
+    # ── Set state to complete ───────────────────────────────────────
+    await db.execute(
+        update(AnalysisRun)
+        .where(AnalysisRun.id == run_id)
+        .values(state="complete", completed_at=func.now())
+    )
+    await db.commit()
+
+    return {
+        "tender_id": tender.id,
+        "run_id": run_id,
+        "company": company,
+        "raw_key": raw_key,
+    }
+
+
+# ---- REQ-009 Slice 5 (QA) — WebSocket test fixtures -------------------------
+
+
+@pytest_asyncio.fixture
+async def redis_client() -> AsyncIterator[Any]:
+    """Real async Redis client for EventBus tests.
+
+    Connects to REDIS_URL from env (falls back to settings.redis_url).
+    Flushes test-prefixed keys (``run:*``) after each test.
+    The production EventBus tests require a real Redis, not fakeredis.
+    """
+    import redis.asyncio as aioredis
+
+    REDIS_URL = os.environ.get("REDIS_URL", settings.redis_url)
+    client = aioredis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+    try:
+        yield client
+    finally:
+        keys = await client.keys("run:*")
+        if keys:
+            await client.delete(*keys)
+        await client.aclose()
+
+
+@pytest_asyncio.fixture
+async def ws_app(db: AsyncSession) -> AsyncIterator[Any]:
+    """FastAPI app for WebSocket testing.
+
+    - Initialises the EventBus singleton with real Redis (lifespan does not run
+      for WebSocket-only ASGI scopes, so we do it manually).
+    - Overrides ``get_session`` with the per-test transactional session.
+    - Yields the app; cleans up the EventBus singleton at teardown.
+    """
+    import app.services.event_bus as eb_module
+
+    app = create_app()
+
+    # Manually initialise EventBus — the lifespan context manager won't run
+    # when ASGIWebSocketTransport sends a ``websocket`` scope directly.
+    eb_module.event_bus = eb_module.EventBus(redis_url=settings.redis_url)
+    await eb_module.event_bus.connect()
+
+    async def _override_session() -> AsyncSession:
+        yield db
+
+    app.dependency_overrides[get_session] = _override_session
+    try:
+        yield app
+    finally:
+        app.dependency_overrides.clear()
+        if eb_module.event_bus:
+            await eb_module.event_bus.disconnect()
+            eb_module.event_bus = None
+
+
+@pytest_asyncio.fixture
+async def active_run(
+    db: AsyncSession,
+    company_with_profile: tuple[Company, str],
+) -> dict:
+    """Create a tender, chunks, and an analysis run in ``running`` state.
+
+    Returns::
+
+        {
+            "run_id": str,
+            "tender_id": str,
+            "company_id": str,
+            "company_api_key": str,
+        }
+
+    The run is set to ``running`` so the WebSocket endpoint will accept
+    connections and wait for events.  No graph execution happens — callers
+    publish events or trigger the graph separately.
+    """
+    from uuid import uuid4
+
+    from app.db.models import AnalysisRun
+    from app.config import get_settings
+
+    company, raw_key = company_with_profile
+    EMBEDDING_STUB = [0.01] * get_settings().embedding_dimensions
+
+    tender = Tender(
+        id=str(uuid4()),
+        company_id=company.id,
+        filename="ws_test.pdf",
+        storage_path="/tmp/ws_test.pdf",
+        file_size_bytes=100,
+        status="ready",
+    )
+    db.add(tender)
+    await db.flush()
+
+    for i in range(3):
+        chunk = TenderChunk(
+            id=str(uuid4()),
+            tender_id=tender.id,
+            company_id=company.id,
+            chunk_index=i,
+            content=f"WS test chunk {i} content for streaming tests.",
+            detected_language="en",
+            embedding=EMBEDDING_STUB,
+        )
+        db.add(chunk)
+    await db.flush()
+
+    run = AnalysisRun(
+        id=str(uuid4()),
+        tender_id=tender.id,
+        company_id=company.id,
+        state="running",
+    )
+    db.add(run)
+    await db.flush()
+    run_id = run.id
+    await db.commit()
+
+    return {
+        "run_id": run_id,
+        "tender_id": tender.id,
+        "company_id": company.id,
+        "company_api_key": raw_key,
+    }
 

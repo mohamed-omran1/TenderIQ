@@ -16,8 +16,10 @@
  * this in a later slice.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import { uploadTender } from "@/lib/api";
 import { useTenderPolling } from "@/lib/useTenderPolling";
+import { triggerAnalysis, ConflictError } from "@/lib/api/analysis";
 import type { UploadError } from "@/lib/types";
 
 const MAX_BYTES = 50 * 1024 * 1024; // 50MB — matches backend max_upload_mb
@@ -93,13 +95,14 @@ function errorMessage(error: UploadError): { title: string; body: string } {
 }
 
 export default function TenderUpload() {
+  const router = useRouter();
   const [view, setView] = useState<View>({ kind: "idle" });
   const [isDragging, setIsDragging] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const abortRef = useRef<AbortController | null>(null);
-  // Filename of the in-flight upload — kept in a ref so the polling effect can
-  // stamp it onto terminal views without reconstructing it from the view union.
   const filenameRef = useRef<string>("");
+  const tenderIdRef = useRef<string>("");
+  const analysisTriggeredRef = useRef(false);
   const { state: poll, start: startPolling, stop: stopPolling } =
     useTenderPolling();
 
@@ -117,10 +120,32 @@ export default function TenderUpload() {
         filename,
         language: poll.tender?.primary_language ?? null,
       });
+
+      if (!analysisTriggeredRef.current && tenderIdRef.current) {
+        analysisTriggeredRef.current = true;
+        const tid = tenderIdRef.current;
+        void triggerAnalysis(tid)
+          .then(() => {
+            router.push(`/tenders/${tid}`);
+          })
+          .catch((err: unknown) => {
+            if (err instanceof ConflictError) {
+              router.push(`/tenders/${tid}`);
+              return;
+            }
+            if (err instanceof Error) {
+              setView({
+                kind: "error",
+                filename,
+                error: { kind: "server_error", status: 0 },
+              });
+            }
+          });
+      }
     } else if (poll.phase === "failed" && poll.error) {
       setView({ kind: "error", filename, error: poll.error });
     }
-  }, [poll.phase, poll.error, poll.tender]);
+  }, [poll.phase, poll.error, poll.tender, router]);
 
   // Cancel any in-flight upload/poll when the component unmounts.
   useEffect(() => () => abortRef.current?.abort(), []);
@@ -175,6 +200,7 @@ export default function TenderUpload() {
       }
 
       // 202 received — begin polling for the terminal status.
+      tenderIdRef.current = result.data.tender_id;
       startPolling({ apiKey: apiKey.trim(), tenderId: result.data.tender_id });
     },
     [apiKey, startPolling, stopPolling],
@@ -193,6 +219,8 @@ export default function TenderUpload() {
   const reset = useCallback(() => {
     abortRef.current?.abort();
     stopPolling();
+    tenderIdRef.current = "";
+    analysisTriggeredRef.current = false;
     setView({ kind: "idle" });
   }, [stopPolling]);
 
